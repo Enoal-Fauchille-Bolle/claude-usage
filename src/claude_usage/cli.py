@@ -122,8 +122,14 @@ def load(days: int) -> list[dict]:
     cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
     seen: dict[str, dict] = {}
 
-    for path in glob.glob(os.path.join(PROJECTS, "*", "*.jsonl")):
-        project = os.path.basename(os.path.dirname(path))
+    # Sub-agents (Agent tool, background tasks) write their own transcripts next
+    # to the session, in <project>/<session-id>/subagents/. They are billed like
+    # any other request but carry the parent's sessionId, so they fold into it.
+    paths = (glob.glob(os.path.join(PROJECTS, "*", "*.jsonl"))
+             + glob.glob(os.path.join(PROJECTS, "*", "*", "subagents", "*.jsonl")))
+
+    for path in paths:
+        project = os.path.relpath(path, PROJECTS).split(os.sep)[0]
         with open(path, errors="replace") as fh:
             for line in fh:
                 if '"usage"' not in line:
