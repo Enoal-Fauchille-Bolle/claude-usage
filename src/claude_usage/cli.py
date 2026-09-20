@@ -38,11 +38,15 @@ import sys
 # --- Calibration -----------------------------------------------------------
 # Measured on a Pro plan by cross-checking this script against /usage:
 #   "Current session: 44% used"  <-> $28.37 of equivalent spend  -> ~$64 per 5h
-#   "Current week: 5% used"      <-> $82.04 of equivalent spend  -> ~$1640 per week
-# The weekly figure was taken while the +50% Claude Code weekly promo was
-# active, so the standard weekly budget is that number divided by 1.5.
+#   "Current week: 38% used"     <-> $125 of equivalent spend    -> ~$330 per week
+# The weekly figure is a re-measure from September: the August one came from a
+# 5% reading, and rounding error is multiplied by 20 at that size. It matches a
+# second reading (main account, 25% with about $40 of Claude Code in it). It
+# includes the +25% weekly bonus granted permanently since 2026-09-14, so it is
+# not divided by anything. Only Claude Code on this machine is counted: claude.ai
+# shares the same limit and is invisible here.
 SESSION_BUDGET = 64.0       # $ equivalent per 5-hour window, one Pro seat
-WEEKLY_BUDGET = 1640.0 / 1.5  # $ equivalent per week, one Pro seat, no promo
+WEEKLY_BUDGET = 330.0       # $ equivalent per week, one Pro seat
 
 # Anthropic list prices, $ per million tokens (input, output).
 PRICES = {
