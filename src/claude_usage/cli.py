@@ -21,7 +21,7 @@ Usage:
     claude-usage --days 7        # shorter window
     claude-usage --sessions 20   # show more sessions in the session table
     claude-usage --json          # machine-readable output
-    claude-usage --graph         # HTML line chart of the official 5-hour/weekly quota
+    claude-usage --graph         # HTML page: official 5-hour/weekly quota, spend by project/model
     claude-usage --graph out.html
 """
 
@@ -86,6 +86,10 @@ QUOTA_HISTORY = os.path.expanduser("~/.claude/state/quota-history.jsonl")
 QUOTA_GRAPH = os.path.expanduser("~/.claude/state/quota-graph.html")
 QUOTA_SPAN = {"five": 5 * 3600, "seven": 7 * 86400}  # window length, seconds
 
+# Projects that get their own colour in the per-day chart. The categorical
+# palette has eight slots; the eighth is "Other".
+STACK_PROJECTS = 7
+
 
 def accounts() -> list[tuple[str, set[str]]]:
     """Map each Claude config directory to the session IDs it produced.
@@ -140,6 +144,7 @@ def load(days: int) -> list[dict]:
     cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
     seen: dict[str, dict] = {}
     unpriced: collections.Counter[str] = collections.Counter()
+    cwds: dict[str, collections.Counter[str]] = collections.defaultdict(collections.Counter)
 
     # Sub-agents (Agent tool, background tasks) write their own transcripts next
     # to the session, in <project>/<session-id>/subagents/. They are billed like
@@ -159,6 +164,8 @@ def load(days: int) -> list[dict]:
                     continue
                 if entry.get("type") != "assistant":
                     continue
+                if entry.get("cwd"):
+                    cwds[project][entry["cwd"]] += 1
                 message = entry.get("message") or {}
                 usage = message.get("usage") or {}
                 if not usage:
@@ -217,7 +224,40 @@ def load(days: int) -> list[dict]:
         print(f"warning: no price for {missing}; left out of every total. "
               "Add them to PRICES.", file=sys.stderr)
 
+    names = project_names(cwds)
+    for r in seen.values():
+        r["project"], r["path"] = names.get(r["project"], (r["project"], r["project"]))
+
     return sorted(seen.values(), key=lambda r: r["t"])
+
+
+def project_names(cwds: dict[str, collections.Counter[str]]) -> dict[str, tuple[str, str]]:
+    """Map each transcript folder to a readable (name, path) pair.
+
+    The folder name is the launch directory with every "/" turned into "-", which
+    cannot be decoded (Astra-ops/infra and Astra/ops-infra encode alike), so the
+    `cwd` recorded on each message is the source. A session can `cd` around; the
+    most frequent cwd is the project. A project nested in another is named after
+    it ("Roots-SMP/web"), and two projects that would share a name keep their path.
+    """
+    home = os.path.expanduser("~")
+    paths = {folder: counts.most_common(1)[0][0] for folder, counts in cwds.items()}
+
+    def name(path: str) -> str:
+        parents = [p for p in paths.values() if path.startswith(p.rstrip(os.sep) + os.sep)]
+        if parents:
+            parent = max(parents, key=len)
+            return f"{name(parent)}/{os.path.relpath(path, parent)}"
+        return os.path.basename(path.rstrip(os.sep)) or path
+
+    def tilde(path: str) -> str:
+        return "~" + path[len(home):] if path == home or path.startswith(home + os.sep) else path
+
+    names = {folder: name(path) for folder, path in paths.items()}
+    clashes = {n for n, count in collections.Counter(names.values()).items() if count > 1}
+    return {folder: (tilde(paths[folder]) if names[folder] in clashes else names[folder],
+                     tilde(paths[folder]))
+            for folder in paths}
 
 
 def weekly(rows: list[dict]) -> list[tuple[dt.date, float]]:
@@ -266,6 +306,7 @@ def sessions(rows: list[dict]) -> list[dict]:
         out.append({
             "id": sid,
             "project": rs[0]["project"],
+            "path": rs[0]["path"],
             "start": rs[0]["t"],
             "hours": (rs[-1]["t"] - rs[0]["t"]).total_seconds() / 3600,
             "requests": len(rs),
@@ -277,6 +318,52 @@ def sessions(rows: list[dict]) -> list[dict]:
             "stale_cost": stale,
         })
     return sorted(out, key=lambda s: -s["cost"])
+
+
+def model_label(model: str) -> str:
+    """"claude-opus-5-5" -> "Opus 5.5"; drops the date suffix of pinned IDs."""
+    parts = [p for p in model.removeprefix("claude-").split("-")
+             if not (p.isdigit() and len(p) == 8)]
+    return " ".join([parts[0].capitalize(), ".".join(parts[1:])]).strip()
+
+
+def spend_data(rows: list[dict], days: int) -> dict:
+    """Aggregate the requests for the spend half of the HTML page."""
+    projects: dict[str, dict] = {}
+    for s in sessions(rows):
+        p = projects.setdefault(s["project"], {
+            "name": s["project"], "path": s["path"], "cost": 0.0, "stale": 0.0,
+            "long": 0.0, "sessions": 0, "requests": 0})
+        p["cost"] += s["cost"]
+        p["stale"] += s["stale_cost"]
+        p["long"] += s["long_cost"]
+        p["sessions"] += 1
+        p["requests"] += s["requests"]
+    ranked = sorted(projects.values(), key=lambda p: -p["cost"])
+
+    # Colours follow the project, ranked over the whole window, so a day never
+    # repaints them. Everything past the palette folds into the last slot.
+    stacked = [p["name"] for p in ranked[:STACK_PROJECTS]]
+    slot = {name: i for i, name in enumerate(stacked)}
+    today = dt.date.today()
+    daily = {today - dt.timedelta(days=i): [0.0] * (len(stacked) + 1) for i in range(days)}
+    models: dict[str, dict] = {}
+    for r in rows:
+        day = r["t"].date()
+        if day in daily:
+            daily[day][slot.get(r["project"], len(stacked))] += r["cost"]
+        m = models.setdefault(r["model"], {"name": model_label(r["model"]), "cost": 0.0, "requests": 0})
+        m["cost"] += r["cost"]
+        m["requests"] += 1
+
+    return {
+        "days": days,
+        "total": sum(r["cost"] for r in rows),
+        "projects": ranked,
+        "stack": stacked + ["Other"],
+        "daily": [{"day": str(d), "v": [round(c, 4) for c in v]} for d, v in sorted(daily.items())],
+        "models": sorted(models.values(), key=lambda m: -m["cost"]),
+    }
 
 
 def report(rows: list[dict], days: int, n_sessions: int) -> None:
@@ -353,7 +440,7 @@ def report(rows: list[dict], days: int, n_sessions: int) -> None:
     for s in sess[:n_sessions]:
         print(f"    {s['id'][:8]:<10}{s['start']:%m-%d %H:%M}  {s['hours']:6.1f}h{s['requests']:6d}"
               f"{s['max_context'] / 1000:8.0f}k{s['cost']:8.1f}{s['long_cost']:8.1f}"
-              f"{s['stale_cost']:7.1f}  {s['project'].split('-')[-1]}")
+              f"{s['stale_cost']:7.1f}  {s['project']}")
     print()
 
 
@@ -407,13 +494,15 @@ GRAPH_TEMPLATE = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Claude quota history</title>
+<title>Claude usage</title>
 <style>
 :root {
   color-scheme: light;
   --page: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink2: #52514e; --muted: #898781;
   --grid: #e1e0d9; --axis: #c3c2b7; --border: rgba(11,11,11,0.10); --hover: rgba(11,11,11,0.05);
   --s1: #2a78d6; --s2: #eb6834;
+  --c0: #2a78d6; --c1: #eb6834; --c2: #1baf7a; --c3: #eda100; --c4: #e87ba4; --c5: #008300;
+  --c6: #4a3aa7; --c7: #b5b4ad;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
@@ -421,6 +510,8 @@ GRAPH_TEMPLATE = """<!doctype html>
     --page: #0d0d0d; --surface: #1a1a19; --ink: #ffffff; --ink2: #c3c2b7; --muted: #898781;
     --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,0.10); --hover: rgba(255,255,255,0.08);
     --s1: #3987e5; --s2: #d95926;
+    --c0: #3987e5; --c1: #d95926; --c2: #199e70; --c3: #c98500; --c4: #d55181; --c5: #008300;
+    --c6: #9085e9; --c7: #5c5b57;
   }
 }
 :root[data-theme="dark"] {
@@ -428,6 +519,8 @@ GRAPH_TEMPLATE = """<!doctype html>
   --page: #0d0d0d; --surface: #1a1a19; --ink: #ffffff; --ink2: #c3c2b7; --muted: #898781;
   --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,0.10); --hover: rgba(255,255,255,0.08);
   --s1: #3987e5; --s2: #d95926;
+  --c0: #3987e5; --c1: #d95926; --c2: #199e70; --c3: #c98500; --c4: #d55181; --c5: #008300;
+  --c6: #9085e9; --c7: #5c5b57;
 }
 * { box-sizing: border-box; }
 body { margin: 0; padding: 24px 16px; background: var(--page); color: var(--ink);
@@ -472,12 +565,25 @@ table { border-collapse: collapse; margin: 8px 0 12px; }
 th, td { text-align: left; padding: 2px 16px 2px 0; font-variant-numeric: tabular-nums; }
 th { color: var(--ink2); font-weight: 500; border-bottom: 1px solid var(--grid); }
 caption { text-align: left; color: var(--ink2); padding: 8px 0 4px; }
+.card + .card { margin-top: 16px; }
+h2 { font-size: 16px; font-weight: 600; margin: 0 0 2px; }
+h3 { font-size: 14px; font-weight: 600; margin: 20px 0 4px; }
+.duo { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 0 24px; }
+.duo .note { margin: 0 0 8px; }
+.bar { fill: var(--c); }
+.k0 { --c: var(--c0); } .k1 { --c: var(--c1); } .k2 { --c: var(--c2); } .k3 { --c: var(--c3); }
+.k4 { --c: var(--c4); } .k5 { --c: var(--c5); } .k6 { --c: var(--c6); } .k7 { --c: var(--c7); }
+.lbl { fill: var(--ink); font-size: 12px; }
+.val { fill: var(--ink2); font-size: 12px; font-variant-numeric: tabular-nums; }
+.hl { fill: var(--hover); }
+.key i.sw, .tip .row i.sw { width: 10px; height: 10px; border: 0; border-radius: 2px; background: var(--c); }
+td.num, th.num { text-align: right; }
 @media (forced-colors: active) { .line.s2 { stroke-dasharray: 6 4; } }
 </style>
 </head>
 <body>
 <main>
-  <h1>Claude quota history</h1>
+  <h1>Claude usage</h1>
   <p class="sub" id="sub"></p>
   <div class="card">
     <div class="filters" id="filters" role="group" aria-label="Time range"></div>
@@ -485,6 +591,30 @@ caption { text-align: left; color: var(--ink2); padding: 8px 0 4px; }
     <p class="note">Each line is one limit window; a break means the window ended or nothing was recorded.
       Readings below an earlier one in the same window are stale and ignored.</p>
     <details><summary>Table view</summary><div id="tables"></div></details>
+  </div>
+  <div class="card" id="spend" hidden>
+    <h2>Claude Code spend</h2>
+    <p class="sub" id="spend-sub"></p>
+    <h3>By project</h3>
+    <div class="plot" id="by-project"></div>
+    <h3>Per day, by project</h3>
+    <div id="per-day"></div>
+    <h3>By model</h3>
+    <div class="plot" id="by-model"></div>
+    <div class="duo">
+      <div>
+        <h3>Cold-cache rewrites</h3>
+        <p class="note">Re-writing the cache after more than an hour idle.</p>
+        <div class="plot" id="waste-stale"></div>
+      </div>
+      <div>
+        <h3>Context over 150k</h3>
+        <p class="note">Everything spent on requests carrying more than 150k tokens.</p>
+        <div class="plot" id="waste-long"></div>
+      </div>
+    </div>
+    <p class="note">Both overlap: a cold rewrite of a long context counts in each.</p>
+    <details><summary>Table view</summary><div id="spend-tables"></div></details>
   </div>
 </main>
 <script type="application/json" id="data">__DATA__</script>
@@ -688,14 +818,234 @@ function tables() {
   }
 }
 
+// --- Spend: dollars estimated from the transcripts, a separate unit from the quota %.
+const S = D.spend;
+const fmtUsd = v => "$" + (v >= 100 ? Math.round(v).toLocaleString() : v.toFixed(v >= 10 ? 1 : 2));
+const fmtPct = v => (S.total ? Math.round(v / S.total * 100) : 0) + "%";
+const fmtDate = new Intl.DateTimeFormat(undefined, { weekday: "short", day: "numeric", month: "short" });
+const dayOf = s => new Date(s + "T00:00:00");
+const slot = j => "k" + Math.min(j, 7);
+
+// A clean axis: four or five steps of 1, 2 or 5 times a power of ten.
+function scale(max) {
+  if (!(max > 0)) return { top: 1, step: 1 };
+  const raw = max / 4, p = 10 ** Math.floor(Math.log10(raw));
+  const step = [1, 2, 5, 10].map(k => k * p).find(s => s >= raw);
+  return { top: Math.ceil(max / step) * step, step };
+}
+
+// Bars round their data end only; the baseline end stays square.
+const barRight = (x, y, w, h) => {
+  const r = Math.min(4, w, h / 2);
+  return `M${x} ${y}H${x + w - r}Q${x + w} ${y} ${x + w} ${y + r}V${y + h - r}Q${x + w} ${y + h} ${x + w - r} ${y + h}H${x}Z`;
+};
+const barUp = (x, y, w, h) => {
+  const r = Math.min(4, h, w / 2);
+  return `M${x} ${y + h}V${y + r}Q${x} ${y} ${x + r} ${y}H${x + w - r}Q${x + w} ${y} ${x + w} ${y + r}V${y + h}Z`;
+};
+
+// Shorten an SVG label with an ellipsis until it fits; the tooltip keeps the full text.
+function fit(t, max) {
+  const full = t.textContent;
+  for (let n = full.length; n > 1 && t.getComputedTextLength() > max; n--) t.textContent = full.slice(0, n - 1) + "…";
+}
+
+function tipRows(tip, title, rows) {
+  tip.replaceChildren(html("div", "when", title));
+  for (const [css, value, label] of rows) {
+    const row = html("div", "row", undefined, tip);
+    if (css) html("i", "sw " + css, undefined, row);
+    html("strong", "", value, row);
+    html("span", "", label, row);
+  }
+}
+
+// Hover and keyboard layer shared by the bar charts: one band per mark, bigger than
+// the mark, a wash behind the hovered band and one tooltip.
+function interact(root, host, width, height, n, band, show) {
+  const hl = svg("rect", { class: "hl", rx: 6, visibility: "hidden" });
+  root.insertBefore(hl, root.firstChild);
+  const tip = html("div", "tip", undefined, host);
+  tip.hidden = true;
+  let cur = -1;
+  const on = i => {
+    cur = i;
+    const [x, y, w, h] = band(i);
+    Object.entries({ x, y, width: w, height: h }).forEach(([k, v]) => hl.setAttribute(k, v));
+    hl.setAttribute("visibility", "visible");
+    const [ax, ay] = show(i, tip);
+    tip.hidden = false;
+    const flip = ax > width * 0.6;
+    tip.style.left = flip ? "auto" : ax + 12 + "px";
+    tip.style.right = flip ? width - ax + 12 + "px" : "auto";
+    tip.style.top = Math.max(0, Math.min(ay - tip.offsetHeight / 2, height - tip.offsetHeight)) + "px";
+  };
+  const off = () => { hl.setAttribute("visibility", "hidden"); tip.hidden = true; };
+  for (let i = 0; i < n; i++) {
+    const [x, y, w, h] = band(i);
+    svg("rect", { x, y, width: w, height: h, fill: "transparent" }, root).addEventListener("pointerenter", () => on(i));
+  }
+  root.addEventListener("pointerleave", off);
+  root.addEventListener("focus", () => on(Math.max(cur, 0)));
+  root.addEventListener("blur", off);
+  root.addEventListener("keydown", e => {
+    if (e.key === "Escape") return off();
+    const step = { ArrowLeft: -1, ArrowUp: -1, ArrowRight: 1, ArrowDown: 1 }[e.key];
+    if (!step) return;
+    e.preventDefault();
+    on(Math.min(n - 1, Math.max(0, cur + step)));
+  });
+}
+
+// Horizontal bars, largest first, each labelled with its value at the tip.
+// items: [{ label, value, title, rows }]; `max` shares one scale across charts.
+function hbar(host, items, aria, max) {
+  host.replaceChildren();
+  if (!items.length) { html("p", "note", "Nothing in this window.", host); return; }
+  const width = Math.max(280, host.clientWidth);
+  const row = 28, thick = 16, labelW = Math.min(150, Math.round(width * 0.34)), valW = 64;
+  const height = items.length * row;
+  const x0 = labelW + 8, plotW = width - x0 - valW;
+  max = max ?? Math.max(...items.map(d => d.value));
+  const W = v => max > 0 ? v / max * plotW : 0;
+  const root = svg("svg", { width, height, viewBox: `0 0 ${width} ${height}`, role: "img", tabindex: 0,
+    "aria-label": aria + "; the table view below has the values" }, host);
+  items.forEach((d, i) => {
+    const cy = i * row + row / 2;
+    const t = svg("text", { class: "lbl", x: labelW, y: cy + 4, "text-anchor": "end" }, root);
+    t.textContent = d.label;
+    fit(t, labelW);
+    if (W(d.value) >= 0.5) svg("path", { class: "bar k0", d: barRight(x0, cy - thick / 2, W(d.value), thick) }, root);
+    svg("text", { class: "val", x: x0 + W(d.value) + 6, y: cy + 4 }, root).textContent = fmtUsd(d.value);
+  });
+  svg("line", { class: "axis", x1: x0, x2: x0, y1: 0, y2: height }, root);
+  interact(root, host, width, height, items.length, i => [0, i * row, width, row],
+    (i, tip) => { tipRows(tip, items[i].title, items[i].rows); return [x0 + W(items[i].value), i * row + row / 2]; });
+}
+
+// One column per day, stacked by project, a 2px surface gap between segments.
+function perDay(host) {
+  host.replaceChildren();
+  const legend = html("div", "legend", undefined, host);
+  S.stack.forEach((name, j) => {
+    if (!S.daily.some(d => d.v[j] > 0)) return;
+    const k = html("span", "key", undefined, legend);
+    html("i", "sw " + slot(j), undefined, k);
+    html("span", "", name, k);
+  });
+  const plot = html("div", "plot", undefined, host);
+  const width = Math.max(320, plot.clientWidth), height = 260;
+  const m = { l: 52, r: 8, t: 12, b: 28 };
+  const n = S.daily.length, bandW = (width - m.l - m.r) / n, bw = Math.max(2, Math.min(24, bandW - 4));
+  const totals = S.daily.map(d => d.v.reduce((a, b) => a + b, 0));
+  const { top, step } = scale(Math.max(...totals));
+  const Y = v => height - m.b - v / top * (height - m.t - m.b);
+  const root = svg("svg", { width, height, viewBox: `0 0 ${width} ${height}`, role: "img", tabindex: 0,
+    "aria-label": "Spend per day, stacked by project; the table view below has the values" }, plot);
+
+  for (let v = 0; v <= top + step / 2; v += step) {
+    svg("line", { class: v === 0 ? "axis" : "grid", x1: m.l, x2: width - m.r, y1: Y(v), y2: Y(v) }, root);
+    svg("text", { class: "tick", x: m.l - 8, y: Y(v) + 4, "text-anchor": "end" }, root).textContent = "$" + v.toLocaleString();
+  }
+  // At most eight day labels, counted back from today so the last column is always named.
+  const every = Math.ceil(n / 8);
+  S.daily.forEach((d, i) => {
+    const cx = m.l + bandW * (i + 0.5);
+    if ((n - 1 - i) % every === 0) {
+      svg("text", { class: "tick", x: cx, y: height - 8, "text-anchor": "middle" }, root).textContent = fmtDay.format(dayOf(d.day));
+    }
+    const segs = d.v.map((v, j) => [v, j]).filter(([v]) => v > 0);
+    let y = Y(0);
+    segs.forEach(([v, j], s) => {
+      const h = Y(0) - Y(v), gap = s ? 2 : 0, yTop = y - h;
+      y = yTop;
+      if (h - gap < 0.5) return;
+      const d = s === segs.length - 1 ? barUp(cx - bw / 2, yTop, bw, h - gap) : `M${cx - bw / 2} ${yTop}h${bw}v${h - gap}h${-bw}Z`;
+      svg("path", { class: "bar " + slot(j), d }, root);
+    });
+  });
+
+  interact(root, plot, width, height, n, i => [m.l + bandW * i, m.t, bandW, Y(0) - m.t], (i, tip) => {
+    const d = S.daily[i];
+    const rows = d.v.map((v, j) => [slot(j), fmtUsd(v), S.stack[j], v]).filter(r => r[3] > 0).sort((a, b) => b[3] - a[3]);
+    tipRows(tip, fmtDate.format(dayOf(d.day)) + " · " + fmtUsd(totals[i]), rows.map(r => r.slice(0, 3)));
+    return [m.l + bandW * (i + 0.5), height / 2];
+  });
+}
+
+// Every project past the first ten folds into one row, so the chart stays readable.
+function projectItems() {
+  const top = S.projects.slice(0, 10), rest = S.projects.slice(10);
+  const items = top.map(p => ({
+    label: p.name, value: p.cost, title: p.path,
+    rows: [["", fmtUsd(p.cost), fmtPct(p.cost) + " of the total"], ["", String(p.sessions), p.sessions === 1 ? "session" : "sessions"],
+      ["", fmtUsd(p.stale), "cold-cache rewrites"], ["", fmtUsd(p.long), "over 150k context"]],
+  }));
+  if (rest.length) {
+    const cost = rest.reduce((a, p) => a + p.cost, 0);
+    items.push({ label: `${rest.length} others`, value: cost, title: rest.map(p => p.name).join(", "),
+      rows: [["", fmtUsd(cost), fmtPct(cost) + " of the total"]] });
+  }
+  return items;
+}
+
+function renderSpend() {
+  if (!S || !S.total) return;
+  hbar(document.getElementById("by-project"), projectItems(), "Spend by project");
+  perDay(document.getElementById("per-day"));
+  hbar(document.getElementById("by-model"), S.models.map(md => ({
+    label: md.name, value: md.cost, title: md.name,
+    rows: [["", fmtUsd(md.cost), fmtPct(md.cost) + " of the total"], ["", md.requests.toLocaleString(), "requests"]],
+  })), "Spend by model");
+
+  // Same projects, same order and one shared scale, so the two sides compare.
+  const waste = S.projects.slice(0, 8);
+  const max = Math.max(...waste.flatMap(p => [p.stale, p.long]));
+  for (const [id, key, what] of [["waste-stale", "stale", "cold-cache rewrites"], ["waste-long", "long", "over 150k context"]]) {
+    hbar(document.getElementById(id), waste.map(p => ({
+      label: p.name, value: p[key], title: p.path,
+      rows: [["", fmtUsd(p[key]), what], ["", p.cost ? Math.round(p[key] / p.cost * 100) + "%" : "–", "of the project's spend"]],
+    })), "Spend on " + what + " by project", max);
+  }
+}
+
+function spendTables() {
+  const host = document.getElementById("spend-tables");
+  const table = (caption, head, rows) => {
+    const t = html("table", "", undefined, host);
+    html("caption", "", caption, t);
+    const tr = html("tr", "", undefined, html("thead", "", undefined, t));
+    head.forEach((h, i) => html("th", i ? "num" : "", h, tr));
+    const body = html("tbody", "", undefined, t);
+    for (const r of rows) {
+      const row = html("tr", "", undefined, body);
+      r.forEach((c, i) => html("td", i ? "num" : "", c, row));
+    }
+  };
+  table("By project", ["Project", "Spend", "Share", "Sessions", "Cold cache", "Over 150k"],
+    S.projects.map(p => [p.path, fmtUsd(p.cost), fmtPct(p.cost), p.sessions, fmtUsd(p.stale), fmtUsd(p.long)]));
+  table("By model", ["Model", "Spend", "Share", "Requests"],
+    S.models.map(md => [md.name, fmtUsd(md.cost), fmtPct(md.cost), md.requests.toLocaleString()]));
+  table("Per day", ["Day", "Total", ...S.stack],
+    S.daily.map(d => [fmtDate.format(dayOf(d.day)), fmtUsd(d.v.reduce((a, b) => a + b, 0)), ...d.v.map(fmtUsd)]));
+}
+
 document.getElementById("sub").textContent =
   "Official /usage percentages recorded by the status line" + (D.account ? " · account " + D.account : "");
 tables();
 render();
+if (S && S.total) {
+  document.getElementById("spend").hidden = false;
+  document.getElementById("spend-sub").textContent = `${fmtUsd(S.total)} over the last ${S.days} days, ` +
+    "estimated from the local transcripts at API list prices, every account on this machine. " +
+    "A different unit from the quota above: claude.ai use is not in it.";
+  spendTables();
+  renderSpend();
+}
 let drawnWidth = document.getElementById("charts").clientWidth;
 new ResizeObserver(() => {
   const w = document.getElementById("charts").clientWidth;
-  if (w !== drawnWidth) { drawnWidth = w; render(); }
+  if (w !== drawnWidth) { drawnWidth = w; render(); renderSpend(); }
 }).observe(document.getElementById("charts"));
 })();
 </script>
@@ -704,8 +1054,9 @@ new ResizeObserver(() => {
 """
 
 
-def write_graph(path: str) -> int:
-    """Render the quota history as a self-contained HTML page (no external assets)."""
+def write_graph(path: str, days: int) -> int:
+    """Render the quota history and the Claude Code spend as a self-contained HTML
+    page (no external assets)."""
     if not os.path.isfile(QUOTA_HISTORY):
         print(f"{QUOTA_HISTORY} not found — the status line records it while Claude Code runs.",
               file=sys.stderr)
@@ -718,13 +1069,16 @@ def write_graph(path: str) -> int:
         print("No usable quota readings recorded yet.", file=sys.stderr)
         return 1
 
-    data = {"now": int(time.time()), "account": account, "five": five, "seven": seven}
+    rows = load(days) if os.path.isdir(PROJECTS) else []
+    data = {"now": int(time.time()), "account": account, "five": five, "seven": seven,
+            "spend": spend_data(rows, days)}
     # "</" would close the <script> block the data is embedded in.
     page = GRAPH_TEMPLATE.replace("__DATA__", json.dumps(data).replace("</", "<\\/"))
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w") as fh:
         fh.write(page)
-    print(f"  wrote {path}  ({len(five)} five-hour and {len(seven)} weekly windows)")
+    print(f"  wrote {path}  ({len(five)} five-hour and {len(seven)} weekly windows, "
+          f"{len(data['spend']['projects'])} projects over {days} days)")
     return 0
 
 
@@ -735,12 +1089,12 @@ def main() -> int:
     parser.add_argument("--json", action="store_true", help="emit JSON instead of a report")
     parser.add_argument("--csv", metavar="PATH", help="also dump every request to a CSV")
     parser.add_argument("--graph", nargs="?", const=QUOTA_GRAPH, metavar="PATH",
-                        help="write an HTML chart of the recorded 5-hour and weekly quota "
-                             f"(default {QUOTA_GRAPH}) and exit")
+                        help="write an HTML page of the recorded 5-hour and weekly quota and "
+                             f"of the spend over --days (default {QUOTA_GRAPH}) and exit")
     args = parser.parse_args()
 
     if args.graph:
-        return write_graph(args.graph)
+        return write_graph(args.graph, args.days)
 
     if not os.path.isdir(PROJECTS):
         print(f"{PROJECTS} not found — is Claude Code installed?", file=sys.stderr)
