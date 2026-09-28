@@ -51,21 +51,24 @@ import time
 SESSION_BUDGET = 64.0       # $ equivalent per 5-hour window, one Pro seat
 WEEKLY_BUDGET = 330.0       # $ equivalent per week, one Pro seat
 
-# Anthropic list prices, $ per million tokens (input, output).
+# Anthropic list prices, $ per million tokens (input, output, cache-read
+# multiplier). Most models read the cache at 0.1x input; the newest read it
+# cheaper. Source: https://platform.claude.com/docs/en/about-claude/pricing
 PRICES = {
-    "claude-opus-5": (5, 25),
-    "claude-opus-4-8": (5, 25),
-    "claude-opus-4-7": (5, 25),
-    "claude-opus-4-6": (5, 25),
-    "claude-sonnet-5": (3, 15),
-    "claude-sonnet-4-6": (3, 15),
-    "claude-haiku-4-5-20251001": (1, 5),
+    "claude-fable-5-1": (10, 50, 0.025),
+    "claude-opus-5-5": (4, 20, 0.05),
+    "claude-opus-5": (5, 25, 0.1),
+    "claude-opus-4-8": (5, 25, 0.1),
+    "claude-opus-4-7": (5, 25, 0.1),
+    "claude-opus-4-6": (5, 25, 0.1),
+    "claude-sonnet-5": (2, 10, 0.1),
+    "claude-sonnet-4-6": (3, 15, 0.1),
+    "claude-haiku-4-5-20251001": (1, 5, 0.1),
 }
 
-# Cache writes cost more than fresh input, cache reads cost far less.
+# Cache writes cost more than fresh input.
 CACHE_WRITE_5M = 1.25
 CACHE_WRITE_1H = 2.0
-CACHE_READ = 0.1
 
 # A request sent with more context than this is flagged as "long context".
 LONG_CONTEXT = 150_000
@@ -131,9 +134,12 @@ def load(days: int) -> list[dict]:
 
     Deduplicated on requestId: a single assistant turn is written to the
     transcript once per content block, so counting lines would double-count.
+    Requests from a Claude model missing in PRICES are left out and reported
+    on stderr, so a new model shows up as a warning rather than as a quiet dip.
     """
     cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
     seen: dict[str, dict] = {}
+    unpriced: collections.Counter[str] = collections.Counter()
 
     # Sub-agents (Agent tool, background tasks) write their own transcripts next
     # to the session, in <project>/<session-id>/subagents/. They are billed like
@@ -178,13 +184,18 @@ def load(days: int) -> list[dict]:
 
                 price = PRICES.get(model)
                 if price is None:
+                    # Only Claude models draw on the subscription. Others reach the
+                    # transcripts through a proxy (NVIDIA NIM), and "<synthetic>"
+                    # marks local messages that were never sent.
+                    if model and model.startswith("claude-"):
+                        unpriced[model] += 1
                     continue
-                rate_in, rate_out = price
+                rate_in, rate_out, cache_read = price
                 cost = (
                     inp * rate_in
                     + write_5m * rate_in * CACHE_WRITE_5M
                     + write_1h * rate_in * CACHE_WRITE_1H
-                    + read * rate_in * CACHE_READ
+                    + read * rate_in * cache_read
                     + out * rate_out
                 ) / 1e6
 
@@ -200,6 +211,11 @@ def load(days: int) -> list[dict]:
                     "context": inp + read + write_total,
                     "cost": cost,
                 }
+
+    if unpriced:
+        missing = ", ".join(f"{m} ({n} requests)" for m, n in unpriced.most_common())
+        print(f"warning: no price for {missing}; left out of every total. "
+              "Add them to PRICES.", file=sys.stderr)
 
     return sorted(seen.values(), key=lambda r: r["t"])
 
