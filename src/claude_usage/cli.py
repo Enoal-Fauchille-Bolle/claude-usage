@@ -61,6 +61,7 @@ PRICES = {
     "claude-opus-4-8": (5, 25, 0.1),
     "claude-opus-4-7": (5, 25, 0.1),
     "claude-opus-4-6": (5, 25, 0.1),
+    "claude-sonnet-5-5": (2, 10, 0.1),
     "claude-sonnet-5": (2, 10, 0.1),
     "claude-sonnet-4-6": (3, 15, 0.1),
     "claude-haiku-4-5-20251001": (1, 5, 0.1),
