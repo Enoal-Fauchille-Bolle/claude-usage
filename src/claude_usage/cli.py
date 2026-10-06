@@ -13,8 +13,9 @@ questions the built-in /usage command cannot:
 Everything is expressed in "API-list-price equivalent" ($). That is NOT what a
 subscription bills -- the plan is a flat fee -- but it is the unit Anthropic
 charges usage credits in, and it tracks plan-limit consumption closely enough to
-be useful. The two calibration constants below were measured by comparing this
-script's output against the percentages reported by /usage on a Pro plan.
+be useful. The weekly and 5-hour budgets are measured from the /usage
+percentages the status line records, with the claude.ai share given by --web;
+two constants below stand in when that history is too thin.
 
 Usage:
     claude-usage                 # last 28 days
@@ -23,6 +24,7 @@ Usage:
     claude-usage --json          # machine-readable output
     claude-usage --graph         # HTML page: official 5-hour/weekly quota, spend by project/model
     claude-usage --graph out.html
+    claude-usage --web 22        # claude.ai took 22% of this week's usage
 """
 
 from __future__ import annotations
@@ -35,21 +37,28 @@ import datetime as dt
 import glob
 import json
 import os
+import statistics
 import sys
 import time
 
 # --- Calibration -----------------------------------------------------------
-# Measured on a Pro plan by cross-checking this script against /usage:
-#   "Current session: 44% used"  <-> $28.37 of equivalent spend  -> ~$64 per 5h
-#   "Current week: 38% used"     <-> $125 of equivalent spend    -> ~$330 per week
-# The weekly figure is a re-measure from September: the August one came from a
-# 5% reading, and rounding error is multiplied by 20 at that size. It matches a
-# second reading (main account, 25% with about $40 of Claude Code in it). It
-# includes the +25% weekly bonus granted permanently since 2026-09-14, so it is
-# not divided by anything. Only Claude Code on this machine is counted: claude.ai
-# shares the same limit and is invisible here.
-SESSION_BUDGET = 64.0       # $ equivalent per 5-hour window, one Pro seat
-WEEKLY_BUDGET = 330.0       # $ equivalent per week, one Pro seat
+# The budgets are measured from the quota history when it allows (see
+# budgets()); these constants are the fallback. Measured on 2026-10-06 on a Pro
+# plan, one account, Opus 5.5 and Sonnet 5.5:
+#   week of 2026-09-29: 63% used, 78% of it Claude Code (claude.ai usage page)
+#                       <-> $132 of equivalent spend          -> ~$270 per week
+#   5-hour windows at 50% or more: $35-44 per 100% in the ones with the least
+#                       claude.ai in them                     -> ~$40 per 5h
+# The $330 and $64 measured in September, on two accounts and older models, no
+# longer match. claude.ai shares the same limit and is invisible in the
+# transcripts, hence the share recorded with --web.
+SESSION_BUDGET = 40.0       # $ equivalent per 5-hour window, one Pro seat
+WEEKLY_BUDGET = 270.0       # $ equivalent per week, one Pro seat
+
+# A window counts towards a measured budget only when it reached this
+# percentage: below it, the 1% rounding of /usage weighs too much. A week only
+# needs its Claude Code part to reach it, since its claude.ai share is known.
+CALIBRATE_MIN_PCT = {"five": 50, "seven": 20}
 
 # Anthropic list prices, $ per million tokens (input, output, cache-read
 # multiplier). Most models read the cache at 0.1x input; the newest read it
@@ -86,6 +95,9 @@ PROJECTS = os.path.expanduser("~/.claude/projects")
 QUOTA_HISTORY = os.path.expanduser("~/.claude/state/quota-history.jsonl")
 QUOTA_GRAPH = os.path.expanduser("~/.claude/state/quota-graph.html")
 QUOTA_SPAN = {"five": 5 * 3600, "seven": 7 * 86400}  # window length, seconds
+# claude-usage --web appends the claude.ai share of each week here, as read on
+# the "usage this week by product" panel of claude.ai.
+WEB_SHARE = os.path.expanduser("~/.claude/state/web-share.jsonl")
 
 # Projects that get their own colour in the per-day chart. The categorical
 # palette has eight slots; the eighth is "Other".
@@ -367,7 +379,7 @@ def spend_data(rows: list[dict], days: int) -> dict:
     }
 
 
-def report(rows: list[dict], days: int, n_sessions: int) -> None:
+def report(rows: list[dict], days: int, n_sessions: int, budget: dict) -> None:
     if not rows:
         print("No transcripts found in the requested window.", file=sys.stderr)
         return
@@ -380,18 +392,20 @@ def report(rows: list[dict], days: int, n_sessions: int) -> None:
 
     print(f"\n  {len(rows):,} requests over {days} days — ${total:,.0f} equivalent\n")
 
-    print("  WEEKLY  (one Pro seat ≈ ${:,.0f}/week)".format(WEEKLY_BUDGET))
+    print(f"  WEEKLY  (one Pro seat ≈ ${budget['weekly']:,.0f}/week, {budget['weekly_from']})")
+    if budget["weekly_from"] == "constant":
+        print("    record this week's claude.ai share with: claude-usage --web <percent>")
     for monday, spend in weekly(rows):
-        pct = spend / WEEKLY_BUDGET * 100
+        pct = spend / budget["weekly"] * 100
         bar = "█" * min(40, round(pct / 2.5))
         print(f"    {monday}  ${spend:7.0f}  {pct:5.1f}%  {bar}")
 
-    print(f"\n  DAILY 5-HOUR PEAK  (limit ≈ ${SESSION_BUDGET:.0f})")
+    print(f"\n  DAILY 5-HOUR PEAK  (limit ≈ ${budget['session']:.0f}, {budget['session_from']})")
     over = 0
     for day, peak, day_total in daily_peaks(rows):
-        hit = peak > SESSION_BUDGET
+        hit = peak > budget["session"]
         over += hit
-        bar = "█" * min(30, round(peak / SESSION_BUDGET * 20))
+        bar = "█" * min(30, round(peak / budget["session"] * 20))
         print(f"    {day}  peak ${peak:6.1f}  day ${day_total:6.1f}  {bar}"
               f"{'  <-- would hit the wall' if hit else ''}")
     print(f"    -> {over} day(s) above the 5-hour limit")
@@ -488,6 +502,112 @@ def load_quota() -> tuple[str, list[dict]]:
     records.sort(key=lambda r: r["ts"])
     account = records[-1].get("account", "") if records else ""
     return account, [r for r in records if r.get("account", "") == account]
+
+
+def load_web_shares(account: str) -> dict[int, float]:
+    """claude.ai share of each week, keyed by the week's reset time. A later
+    entry for the same week replaces an earlier one, so a typo is fixed by
+    recording again."""
+    shares: dict[int, float] = {}
+    if not os.path.isfile(WEB_SHARE):
+        return shares
+    with open(WEB_SHARE, errors="replace") as fh:
+        for line in fh:
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(rec, dict) and rec.get("account", "") == account \
+                    and isinstance(rec.get("seven_reset"), int) \
+                    and isinstance(rec.get("web"), (int, float)):
+                shares[rec["seven_reset"]] = rec["web"]
+    return shares
+
+
+def record_web(pct: float) -> int:
+    """Append the claude.ai share of the week in progress to WEB_SHARE."""
+    if not 0 <= pct <= 100:
+        print("--web takes a percentage between 0 and 100.", file=sys.stderr)
+        return 1
+    if not os.path.isfile(QUOTA_HISTORY):
+        print(f"{QUOTA_HISTORY} not found — the status line records it while Claude Code runs.",
+              file=sys.stderr)
+        return 1
+    account, records = load_quota()
+    weeks = quota_segments(records, "seven")
+    if not weeks:
+        print("No weekly quota reading recorded yet: the week in progress is unknown.",
+              file=sys.stderr)
+        return 1
+    # The weekly reset falls at the same time every week, so a week that began
+    # after the last reading is found by stepping forward from it.
+    reset, now = weeks[-1]["reset"], time.time()
+    while reset <= now:
+        reset += QUOTA_SPAN["seven"]
+    os.makedirs(os.path.dirname(WEB_SHARE), exist_ok=True)
+    with open(WEB_SHARE, "a") as fh:
+        fh.write(json.dumps({"ts": int(now), "account": account,
+                             "seven_reset": int(reset), "web": pct}) + "\n")
+    print(f"  recorded: week ending {dt.datetime.fromtimestamp(reset):%Y-%m-%d %H:%M}, "
+          f"claude.ai {pct:g}%")
+    return 0
+
+
+def budgets(rows: list[dict], days: int) -> dict:
+    """$ equivalent of a full week and of a full 5-hour window, measured from the
+    quota history, or the constants when it does not allow it.
+
+    Weekly: Claude Code spend over a week divided by the part of the week's
+    percentage that was Claude Code, which only the recorded claude.ai share
+    gives; the median over such weeks.
+    5-hour: claude.ai raises the percentage without leaving any spend here, so
+    the windows with the most $ per % are the ones with the least claude.ai in
+    them; the median of the top quarter of windows that reached
+    CALIBRATE_MIN_PCT. Only windows inside the --days span count.
+    """
+    out = {"weekly": WEEKLY_BUDGET, "weekly_from": "constant",
+           "session": SESSION_BUDGET, "session_from": "constant"}
+    if not rows or not os.path.isfile(QUOTA_HISTORY):
+        return out
+
+    stamps = [r["t"].timestamp() for r in rows]
+    running = [0.0]
+    for r in rows:
+        running.append(running[-1] + r["cost"])
+
+    def spend(start: float, end: float) -> float:
+        return running[bisect.bisect_left(stamps, end)] - running[bisect.bisect_left(stamps, start)]
+
+    cutoff = time.time() - days * 86400
+    account, records = load_quota()
+    shares = load_web_shares(account)
+
+    weekly = []
+    for w in quota_segments(records, "seven"):
+        start = w["reset"] - QUOTA_SPAN["seven"]
+        if w["reset"] not in shares or not w["points"] or start < cutoff:
+            continue
+        code_pct = w["points"][-1][1] * (100 - shares[w["reset"]]) / 100
+        if code_pct >= CALIBRATE_MIN_PCT["seven"]:
+            weekly.append(spend(start, w["reset"]) / code_pct * 100)
+    if weekly:
+        out["weekly"] = statistics.median(weekly)
+        out["weekly_from"] = f"{len(weekly)} week(s) with their claude.ai share"
+
+    ratios = []
+    for w in quota_segments(records, "five"):
+        start = w["reset"] - QUOTA_SPAN["five"]
+        if not w["points"] or start < cutoff:
+            continue
+        peak = w["points"][-1][1]
+        if peak >= CALIBRATE_MIN_PCT["five"]:
+            ratios.append(spend(start, w["reset"]) / peak * 100)
+    if len(ratios) >= 4:
+        top = sorted(ratios)[-(len(ratios) // 4):]
+        out["session"] = statistics.median(top)
+        out["session_from"] = (f"top quarter of {len(ratios)} five-hour windows "
+                               f"at {CALIBRATE_MIN_PCT['five']}%+")
+    return out
 
 
 GRAPH_TEMPLATE = """<!doctype html>
@@ -1092,7 +1212,13 @@ def main() -> int:
     parser.add_argument("--graph", nargs="?", const=QUOTA_GRAPH, metavar="PATH",
                         help="write an HTML page of the recorded 5-hour and weekly quota and "
                              f"of the spend over --days (default {QUOTA_GRAPH}) and exit")
+    parser.add_argument("--web", type=float, metavar="PERCENT",
+                        help="record the claude.ai share of the week in progress, as shown by "
+                             "claude.ai's usage page, and exit")
     args = parser.parse_args()
+
+    if args.web is not None:
+        return record_web(args.web)
 
     if args.graph:
         return write_graph(args.graph, args.days)
@@ -1102,6 +1228,7 @@ def main() -> int:
         return 1
 
     rows = load(args.days)
+    budget = budgets(rows, args.days)
 
     if args.csv:
         with open(args.csv, "w", newline="") as fh:
@@ -1114,13 +1241,14 @@ def main() -> int:
         json.dump({
             "days": args.days,
             "total": sum(r["cost"] for r in rows),
+            "budgets": budget,
             "weekly": [{"week": str(w), "cost": c} for w, c in weekly(rows)],
             "daily": [{"day": str(d), "peak_5h": p, "total": t} for d, p, t in daily_peaks(rows)],
             "sessions": [{**s, "start": s["start"].isoformat()} for s in sessions(rows)],
         }, sys.stdout, indent=2)
         return 0
 
-    report(rows, args.days, args.sessions)
+    report(rows, args.days, args.sessions, budget)
     return 0
 
 
