@@ -22,7 +22,8 @@ Usage:
     claude-usage --days 7        # shorter window
     claude-usage --sessions 20   # show more sessions in the session table
     claude-usage --json          # machine-readable output
-    claude-usage --graph         # HTML page: official 5-hour/weekly quota, spend by project/model
+    claude-usage --graph         # HTML page: official 5-hour/weekly quota, spend by project/model,
+                                 # every figure following its 24 h / 3 days / 7 days / All filter
     claude-usage --graph out.html
     claude-usage --web 22        # claude.ai took 22% of this week's usage
 """
@@ -146,15 +147,16 @@ def accounts() -> list[tuple[str, set[str]]]:
     return found
 
 
-def load(days: int) -> list[dict]:
+def load(days: int | None) -> list[dict]:
     """Replay every assistant request from the transcripts into a flat list.
 
     Deduplicated on requestId: a single assistant turn is written to the
     transcript once per content block, so counting lines would double-count.
     Requests from a Claude model missing in PRICES are left out and reported
     on stderr, so a new model shows up as a warning rather than as a quiet dip.
+    `days` of None keeps every request.
     """
-    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
+    cutoff = None if days is None else dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
     seen: dict[str, dict] = {}
     unpriced: collections.Counter[str] = collections.Counter()
     cwds: dict[str, collections.Counter[str]] = collections.defaultdict(collections.Counter)
@@ -187,7 +189,7 @@ def load(days: int) -> list[dict]:
                 if key in seen:
                     continue
                 when = dt.datetime.fromisoformat(entry["timestamp"].replace("Z", "+00:00"))
-                if when < cutoff:
+                if cutoff and when < cutoff:
                     continue
 
                 created = usage.get("cache_creation") or {}
@@ -302,6 +304,12 @@ def daily_peaks(rows: list[dict]) -> list[tuple[dt.date, float, float]]:
     return [(d, peak[d], total[d]) for d in sorted(peak)]
 
 
+def cold_rewrite(before: dict, after: dict) -> bool:
+    """Whether `after` re-writes the context into a cache that went cold while idle."""
+    idle = (after["t"] - before["t"]).total_seconds() / 3600
+    return idle > CACHE_LIFETIME_H and after["write"] > 50_000
+
+
 def sessions(rows: list[dict]) -> list[dict]:
     grouped: dict[str, list[dict]] = collections.defaultdict(list)
     for r in rows:
@@ -312,8 +320,7 @@ def sessions(rows: list[dict]) -> list[dict]:
         stale = 0.0
         gaps = 0
         for before, after in zip(rs, rs[1:]):
-            idle = (after["t"] - before["t"]).total_seconds() / 3600
-            if idle > CACHE_LIFETIME_H and after["write"] > 50_000:
+            if cold_rewrite(before, after):
                 gaps += 1
                 stale += after["write_cost"]
         out.append({
@@ -340,42 +347,47 @@ def model_label(model: str) -> str:
     return " ".join([parts[0].capitalize(), ".".join(parts[1:])]).strip()
 
 
-def spend_data(rows: list[dict], days: int) -> dict:
-    """Aggregate the requests for the spend half of the HTML page."""
-    projects: dict[str, dict] = {}
-    for s in sessions(rows):
-        p = projects.setdefault(s["project"], {
-            "name": s["project"], "path": s["path"], "cost": 0.0, "stale": 0.0,
-            "long": 0.0, "sessions": 0, "requests": 0})
-        p["cost"] += s["cost"]
-        p["stale"] += s["stale_cost"]
-        p["long"] += s["long_cost"]
-        p["sessions"] += 1
-        p["requests"] += s["requests"]
-    ranked = sorted(projects.values(), key=lambda p: -p["cost"])
+def spend_data(rows: list[dict]) -> dict:
+    """Every request, compact, for the spend half of the HTML page.
 
-    # Colours follow the project, ranked over the whole window, so a day never
-    # repaints them. Everything past the palette folds into the last slot.
-    stacked = [p["name"] for p in ranked[:STACK_PROJECTS]]
-    slot = {name: i for i, name in enumerate(stacked)}
-    today = dt.date.today()
-    daily = {today - dt.timedelta(days=i): [0.0] * (len(stacked) + 1) for i in range(days)}
-    models: dict[str, dict] = {}
+    The page adds them up itself, so that its time range filter can recut the
+    spend. A request is [time, project, model, session, cost, cold-cache rewrite
+    cost, 1 if over LONG_CONTEXT], the project and model being indexes into the
+    two ranked lists, and the session an index of its own.
+    """
+    by_project: collections.Counter[str] = collections.Counter()
+    by_model: collections.Counter[str] = collections.Counter()
+    paths: dict[str, str] = {}
     for r in rows:
-        day = r["t"].date()
-        if day in daily:
-            daily[day][slot.get(r["project"], len(stacked))] += r["cost"]
-        m = models.setdefault(r["model"], {"name": model_label(r["model"]), "cost": 0.0, "requests": 0})
-        m["cost"] += r["cost"]
-        m["requests"] += 1
+        by_project[r["project"]] += r["cost"]
+        by_model[model_label(r["model"])] += r["cost"]
+        paths.setdefault(r["project"], r["path"])
+    ranked = [name for name, _ in by_project.most_common()]
+    project_slot = {name: i for i, name in enumerate(ranked)}
+    model_slot = {name: i for i, (name, _) in enumerate(by_model.most_common())}
+
+    session_slot: dict[str, int] = {}
+    previous: dict[str, dict] = {}
+    requests = []
+    for r in rows:
+        before = previous.get(r["session"])
+        previous[r["session"]] = r
+        cold = before is not None and cold_rewrite(before, r)
+        requests.append([
+            int(r["t"].timestamp()),
+            project_slot[r["project"]],
+            model_slot[model_label(r["model"])],
+            session_slot.setdefault(r["session"], len(session_slot)),
+            round(r["cost"], 5),
+            round(r["write_cost"], 5) if cold else 0,
+            int(r["context"] > LONG_CONTEXT),
+        ])
 
     return {
-        "days": days,
-        "total": sum(r["cost"] for r in rows),
-        "projects": ranked,
-        "stack": stacked + ["Other"],
-        "daily": [{"day": str(d), "v": [round(c, 4) for c in v]} for d, v in sorted(daily.items())],
-        "models": sorted(models.values(), key=lambda m: -m["cost"]),
+        "projects": [{"name": name, "path": paths[name]} for name in ranked],
+        "colours": STACK_PROJECTS,
+        "models": list(model_slot),
+        "requests": requests,
     }
 
 
@@ -718,7 +730,7 @@ td.num, th.num { text-align: right; }
     <p class="sub" id="spend-sub"></p>
     <h3>By project</h3>
     <div class="plot" id="by-project"></div>
-    <h3>Per day, by project</h3>
+    <h3 id="per-day-title">Per day, by project</h3>
     <div id="per-day"></div>
     <h3>By model</h3>
     <div class="plot" id="by-model"></div>
@@ -919,20 +931,22 @@ function render() {
     const b = html("button", "", name, filters);
     b.type = "button";
     b.setAttribute("aria-pressed", String(i === sel));
-    b.addEventListener("click", () => { sel = i; render(); });
+    b.addEventListener("click", () => { sel = i; update(); });
   });
 }
 
 function tables() {
   const host = document.getElementById("tables");
+  host.replaceChildren();
   const fmt = t => fmtWhen.format(new Date(t * 1000));
+  const x0 = domain()[0];
   for (const s of SERIES) {
     const table = html("table", "", undefined, host);
     html("caption", "", s.label, table);
     const head = html("tr", "", undefined, html("thead", "", undefined, table));
     ["First reading", "Last reading", "Window resets", "Peak"].forEach(h => html("th", "", h, head));
     const body = html("tbody", "", undefined, table);
-    for (const g of s.segs) {
+    for (const g of s.segs.filter(g => g.end >= x0)) {
       const row = html("tr", "", undefined, body);
       [fmt(g.points[0][0]), fmt(g.end), fmt(g.reset), g.points[g.points.length - 1][1] + "%"].forEach(c => html("td", "", c, row));
     }
@@ -940,12 +954,64 @@ function tables() {
 }
 
 // --- Spend: dollars estimated from the transcripts, a separate unit from the quota %.
-const S = D.spend;
+// RAW holds every request; S is RAW added up over the selected range (see aggregate()).
+const RAW = D.spend;
+let S = null;
 const fmtUsd = v => "$" + (v >= 100 ? Math.round(v).toLocaleString() : v.toFixed(v >= 10 ? 1 : 2));
 const fmtPct = v => (S.total ? Math.round(v / S.total * 100) : 0) + "%";
 const fmtDate = new Intl.DateTimeFormat(undefined, { weekday: "short", day: "numeric", month: "short" });
-const dayOf = s => new Date(s + "T00:00:00");
 const slot = j => "k" + Math.min(j, 7);
+
+// Adds the requests of the selected range up into what the charts draw. A range of
+// 24 h or less is cut by hour, a longer one by day; "All" starts at the first request.
+// A request is [time, project, model, session, cost, cold-cache rewrite cost, over 150k].
+function aggregate() {
+  const range = presets[sel][1], from = range ? D.now - range : 0;
+  const hourly = range > 0 && range <= DAY;
+  const projects = RAW.projects.map(p => ({ ...p, cost: 0, stale: 0, long: 0, ids: new Set() }));
+  const models = RAW.models.map(name => ({ name, cost: 0, requests: 0 }));
+  const binOf = t => {
+    const d = new Date(t * 1000);
+    if (hourly) d.setMinutes(0, 0, 0); else d.setHours(0, 0, 0, 0);
+    return d.getTime() / 1000;
+  };
+  const inRange = RAW.requests.filter(r => r[0] >= from);
+  let total = 0, start = Infinity;
+  for (const [t, p, m, id, cost, stale, long] of inRange) {
+    total += cost;
+    start = Math.min(start, t);
+    const pr = projects[p];
+    pr.cost += cost; pr.stale += stale; pr.ids.add(id);
+    if (long) pr.long += cost;
+    models[m].cost += cost; models[m].requests++;
+  }
+
+  // Colours follow the projects ranked over the selected range, so the biggest of
+  // the range always stands out; everything past the palette folds into "Other".
+  const ranked = projects.map((p, i) => i).filter(i => projects[i].cost > 0).sort((a, b) => projects[b].cost - projects[a].cost);
+  const slotOf = new Map(ranked.map((p, i) => [p, Math.min(i, RAW.colours)]));
+  const stack = ranked.slice(0, RAW.colours).map(i => projects[i].name).concat("Other");
+  const empty = () => new Array(stack.length).fill(0);
+  const bins = new Map();
+  for (const [t, p, , , cost] of inRange) {
+    const b = binOf(t);
+    if (!bins.has(b)) bins.set(b, empty());
+    bins.get(b)[slotOf.get(p)] += cost;
+  }
+
+  // One column per hour or day up to now, the empty ones included.
+  const daily = [];
+  const step = d => hourly ? d.setHours(d.getHours() + 1) : d.setDate(d.getDate() + 1);
+  for (const d = new Date(binOf(from || (start === Infinity ? D.now : start)) * 1000); d.getTime() / 1000 <= D.now; step(d)) {
+    const t = d.getTime() / 1000;
+    daily.push({ t, v: (bins.get(t) ?? empty()).map(c => Math.round(c * 1e4) / 1e4) });
+  }
+  return {
+    total, hourly, start, daily, stack,
+    projects: projects.filter(p => p.cost > 0).map(p => ({ ...p, sessions: p.ids.size })).sort((a, b) => b.cost - a.cost),
+    models: models.filter(m => m.requests).sort((a, b) => b.cost - a.cost),
+  };
+}
 
 // A clean axis: four or five steps of 1, 2 or 5 times a power of ten.
 function scale(max) {
@@ -1062,18 +1128,19 @@ function perDay(host) {
   const { top, step } = scale(Math.max(...totals));
   const Y = v => height - m.b - v / top * (height - m.t - m.b);
   const root = svg("svg", { width, height, viewBox: `0 0 ${width} ${height}`, role: "img", tabindex: 0,
-    "aria-label": "Spend per day, stacked by project; the table view below has the values" }, plot);
+    "aria-label": `Spend per ${S.hourly ? "hour" : "day"}, stacked by project; the table view below has the values` }, plot);
 
   for (let v = 0; v <= top + step / 2; v += step) {
     svg("line", { class: v === 0 ? "axis" : "grid", x1: m.l, x2: width - m.r, y1: Y(v), y2: Y(v) }, root);
     svg("text", { class: "tick", x: m.l - 8, y: Y(v) + 4, "text-anchor": "end" }, root).textContent = "$" + v.toLocaleString();
   }
-  // At most eight day labels, counted back from today so the last column is always named.
+  // At most eight labels, counted back from now so the last column is always named.
   const every = Math.ceil(n / 8);
   S.daily.forEach((d, i) => {
     const cx = m.l + bandW * (i + 0.5);
     if ((n - 1 - i) % every === 0) {
-      svg("text", { class: "tick", x: cx, y: height - 8, "text-anchor": "middle" }, root).textContent = fmtDay.format(dayOf(d.day));
+      svg("text", { class: "tick", x: cx, y: height - 8, "text-anchor": "middle" }, root)
+        .textContent = (S.hourly ? fmtHour : fmtDay).format(new Date(d.t * 1000));
     }
     const segs = d.v.map((v, j) => [v, j]).filter(([v]) => v > 0);
     let y = Y(0);
@@ -1089,7 +1156,7 @@ function perDay(host) {
   interact(root, plot, width, height, n, i => [m.l + bandW * i, m.t, bandW, Y(0) - m.t], (i, tip) => {
     const d = S.daily[i];
     const rows = d.v.map((v, j) => [slot(j), fmtUsd(v), S.stack[j], v]).filter(r => r[3] > 0).sort((a, b) => b[3] - a[3]);
-    tipRows(tip, fmtDate.format(dayOf(d.day)) + " · " + fmtUsd(totals[i]), rows.map(r => r.slice(0, 3)));
+    tipRows(tip, (S.hourly ? fmtWhen : fmtDate).format(new Date(d.t * 1000)) + " · " + fmtUsd(totals[i]), rows.map(r => r.slice(0, 3)));
     return [m.l + bandW * (i + 0.5), height / 2];
   });
 }
@@ -1111,7 +1178,8 @@ function projectItems() {
 }
 
 function renderSpend() {
-  if (!S || !S.total) return;
+  if (!S) return;
+  document.getElementById("per-day-title").textContent = S.hourly ? "Per hour, by project" : "Per day, by project";
   hbar(document.getElementById("by-project"), projectItems(), "Spend by project");
   perDay(document.getElementById("per-day"));
   hbar(document.getElementById("by-model"), S.models.map(md => ({
@@ -1132,6 +1200,7 @@ function renderSpend() {
 
 function spendTables() {
   const host = document.getElementById("spend-tables");
+  host.replaceChildren();
   const table = (caption, head, rows) => {
     const t = html("table", "", undefined, host);
     html("caption", "", caption, t);
@@ -1147,22 +1216,29 @@ function spendTables() {
     S.projects.map(p => [p.path, fmtUsd(p.cost), fmtPct(p.cost), p.sessions, fmtUsd(p.stale), fmtUsd(p.long)]));
   table("By model", ["Model", "Spend", "Share", "Requests"],
     S.models.map(md => [md.name, fmtUsd(md.cost), fmtPct(md.cost), md.requests.toLocaleString()]));
-  table("Per day", ["Day", "Total", ...S.stack],
-    S.daily.map(d => [fmtDate.format(dayOf(d.day)), fmtUsd(d.v.reduce((a, b) => a + b, 0)), ...d.v.map(fmtUsd)]));
+  table(S.hourly ? "Per hour" : "Per day", [S.hourly ? "Hour" : "Day", "Total", ...S.stack],
+    S.daily.map(d => [(S.hourly ? fmtWhen : fmtDate).format(new Date(d.t * 1000)), fmtUsd(d.v.reduce((a, b) => a + b, 0)), ...d.v.map(fmtUsd)]));
 }
 
 document.getElementById("sub").textContent =
   "Official /usage percentages recorded by the status line" + (D.account ? " · account " + D.account : "");
-tables();
-render();
-if (S && S.total) {
+
+// The range filter drives the quota chart, its tables and the whole spend card.
+function update() {
+  render();
+  tables();
+  if (!RAW.requests.length) return;
+  S = aggregate();
+  const [name, range] = presets[sel];
   document.getElementById("spend").hidden = false;
-  document.getElementById("spend-sub").textContent = `${fmtUsd(S.total)} over the last ${S.days} days, ` +
+  document.getElementById("spend-sub").textContent = `${fmtUsd(S.total)} over ` +
+    (range ? "the last " + name : "every transcript, since " + fmtDate.format(new Date(S.start * 1000))) + ", " +
     "estimated from the local transcripts at API list prices, every account on this machine. " +
     "A different unit from the quota above: claude.ai use is not in it.";
   spendTables();
   renderSpend();
 }
+update();
 let drawnWidth = document.getElementById("charts").clientWidth;
 new ResizeObserver(() => {
   const w = document.getElementById("charts").clientWidth;
@@ -1175,9 +1251,10 @@ new ResizeObserver(() => {
 """
 
 
-def write_graph(path: str, days: int) -> int:
+def write_graph(path: str) -> int:
     """Render the quota history and the Claude Code spend as a self-contained HTML
-    page (no external assets)."""
+    page (no external assets). The spend covers every transcript, since the page's
+    time range filter cuts it down."""
     if not os.path.isfile(QUOTA_HISTORY):
         print(f"{QUOTA_HISTORY} not found — the status line records it while Claude Code runs.",
               file=sys.stderr)
@@ -1190,16 +1267,16 @@ def write_graph(path: str, days: int) -> int:
         print("No usable quota readings recorded yet.", file=sys.stderr)
         return 1
 
-    rows = load(days) if os.path.isdir(PROJECTS) else []
+    rows = load(None) if os.path.isdir(PROJECTS) else []
     data = {"now": int(time.time()), "account": account, "five": five, "seven": seven,
-            "spend": spend_data(rows, days)}
+            "spend": spend_data(rows)}
     # "</" would close the <script> block the data is embedded in.
     page = GRAPH_TEMPLATE.replace("__DATA__", json.dumps(data).replace("</", "<\\/"))
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w") as fh:
         fh.write(page)
     print(f"  wrote {path}  ({len(five)} five-hour and {len(seven)} weekly windows, "
-          f"{len(data['spend']['projects'])} projects over {days} days)")
+          f"{len(rows)} requests from {len(data['spend']['projects'])} projects)")
     return 0
 
 
@@ -1211,7 +1288,8 @@ def main() -> int:
     parser.add_argument("--csv", metavar="PATH", help="also dump every request to a CSV")
     parser.add_argument("--graph", nargs="?", const=QUOTA_GRAPH, metavar="PATH",
                         help="write an HTML page of the recorded 5-hour and weekly quota and "
-                             f"of the spend over --days (default {QUOTA_GRAPH}) and exit")
+                             "of the spend, both cut by its time range filter over every "
+                             f"transcript, --days not applying (default {QUOTA_GRAPH}) and exit")
     parser.add_argument("--web", type=float, metavar="PERCENT",
                         help="record the claude.ai share of the week in progress, as shown by "
                              "claude.ai's usage page, and exit")
@@ -1221,7 +1299,7 @@ def main() -> int:
         return record_web(args.web)
 
     if args.graph:
-        return write_graph(args.graph, args.days)
+        return write_graph(args.graph)
 
     if not os.path.isdir(PROJECTS):
         print(f"{PROJECTS} not found — is Claude Code installed?", file=sys.stderr)
