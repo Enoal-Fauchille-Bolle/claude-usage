@@ -667,6 +667,8 @@ h1 { font-size: 20px; font-weight: 600; margin: 0 0 2px; }
   border-radius: 8px; padding: 4px 12px; cursor: pointer; }
 .filters button:hover { background: var(--hover); }
 .filters button[aria-pressed="true"] { color: var(--ink); font-weight: 600; border-color: var(--border); }
+.filters button:disabled { opacity: 0.4; cursor: default; background: none; }
+.filters .toggle { margin-left: auto; }
 .legend { display: flex; flex-wrap: wrap; gap: 4px 24px; margin: 0 0 4px; }
 .key { display: inline-flex; align-items: center; gap: 8px; color: var(--ink2); }
 .key i { width: 16px; height: 0; border-top: 2px solid var(--c); border-radius: 1px; }
@@ -684,6 +686,19 @@ h1 { font-size: 20px; font-weight: 600; margin: 0 0 2px; }
 .line { stroke: var(--c); }
 .dot { fill: var(--c); stroke: var(--surface); stroke-width: 2; }
 .cross { stroke: var(--muted); stroke-width: 1; }
+.pace { stroke: var(--c); stroke-width: 1.5; stroke-dasharray: 5 4; opacity: 0.6; }
+.proj { stroke: var(--c); stroke-width: 2; stroke-dasharray: 1 5; stroke-linecap: round; }
+.ahead { fill: var(--c4); opacity: 0.22; }
+.behind { fill: var(--c2); opacity: 0.22; }
+.future { fill: var(--hover); }
+.now { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 2 3; }
+button.key { font: inherit; background: none; border: 1px solid transparent; border-radius: 8px;
+  padding: 2px 6px; cursor: pointer; }
+button.key:hover { background: var(--hover); }
+.key i.dash { border-top-style: dashed; opacity: 0.35; }
+button.key[aria-pressed="true"] { border-color: var(--border); }
+button.key[aria-pressed="true"] i.dash { opacity: 1; }
+.key .proj-txt { color: var(--ink2); font-variant-numeric: tabular-nums; }
 .tip { position: absolute; pointer-events: none; background: var(--surface); border: 1px solid var(--border);
   border-radius: 8px; padding: 8px 10px; box-shadow: 0 4px 16px rgba(0,0,0,0.12); white-space: nowrap; z-index: 1; }
 .tip .when { color: var(--ink2); margin-bottom: 4px; }
@@ -722,7 +737,9 @@ td.num, th.num { text-align: right; }
     <div class="filters" id="filters" role="group" aria-label="Time range"></div>
     <div id="charts"></div>
     <p class="note">Each line is one limit window; a break means the window ended or nothing was recorded.
-      Readings below an earlier one in the same window are stale and ignored.</p>
+      Readings below an earlier one in the same window are stale and ignored.
+      Click a legend entry for its pace line (where usage would sit if spread evenly over the window)
+      and the dotted projection of the current window at its average rate so far.</p>
     <details><summary>Table view</summary><div id="tables"></div></details>
   </div>
   <div class="card" id="spend" hidden>
@@ -757,8 +774,8 @@ const D = JSON.parse(document.getElementById("data").textContent);
 const NS = "http://www.w3.org/2000/svg";
 const HOUR = 3600, DAY = 86400;
 const SERIES = [
-  { key: "five", label: "5-hour session", css: "s1", segs: D.five },
-  { key: "seven", label: "Weekly", css: "s2", segs: D.seven },
+  { key: "five", label: "5-hour session", css: "s1", segs: D.five, span: 5 * HOUR },
+  { key: "seven", label: "Weekly", css: "s2", segs: D.seven, span: 7 * DAY },
 ];
 const times = SERIES.flatMap(s => s.segs.flatMap(g => g.points.map(p => p[0])));
 const first = Math.min(...times), span = D.now - first;
@@ -767,6 +784,10 @@ presets.push(["All", 0]);
 
 // A weekly window is 7 days long, so that is the view that shows a whole one.
 let sel = Math.max(presets.findIndex(([name]) => name === "7 days"), 0) || presets.length - 1;
+
+// Pace lines, off until their legend entry is clicked, and the shading of the gap to them.
+const paceOn = { five: false, seven: false };
+let gap = false;
 
 const fmtWhen = new Intl.DateTimeFormat(undefined, { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
 const fmtDay = new Intl.DateTimeFormat(undefined, { weekday: "short", day: "numeric" });
@@ -786,7 +807,17 @@ const html = (tag, cls, text, parent) => {
   return e;
 };
 
-const domain = () => [presets[sel][1] ? Math.max(D.now - presets[sel][1], first) : first, D.now];
+// A pace line carries the axis past now, to the reset of its active window, so the
+// projection has room; the future never takes more than a third of the axis.
+const domain = () => {
+  const x0 = presets[sel][1] ? Math.max(D.now - presets[sel][1], first) : first;
+  let x1 = D.now;
+  for (const s of SERIES) {
+    const g = active(s);
+    if (paceOn[s.key] && g) x1 = Math.max(x1, g.reset);
+  }
+  return [x0, Math.min(x1, D.now + (D.now - x0) / 2)];
+};
 
 // Value of a series at time t: the last reading of the window that covers t.
 function valueAt(s, t) {
@@ -798,6 +829,42 @@ function valueAt(s, t) {
     }
   }
   return null;
+}
+
+const active = s => { const g = s.segs[s.segs.length - 1]; return g && g.reset > D.now ? g : null; };
+
+// Pace at time t: the share of the covering window already elapsed.
+function paceAt(s, t) {
+  const g = s.segs.find(g => t >= g.reset - s.span && t < g.reset);
+  return g ? Math.round((t - (g.reset - s.span)) / s.span * 100) : null;
+}
+
+// The active window carried on at its average rate since it began: either the
+// moment it reaches 100%, or the percentage it ends on.
+function projection(s) {
+  const g = active(s);
+  if (!g) return null;
+  const start = g.reset - s.span, v = g.points[g.points.length - 1][1], el = D.now - start;
+  if (v <= 0 || el <= 0) return null;
+  const atReset = v * s.span / el;
+  return atReset >= 100 ? { hit: true, t: start + el * 100 / v, v: 100, from: v }
+    : { hit: false, t: g.reset, v: Math.round(atReset), from: v };
+}
+
+// Shades between the usage line and the pace line: the same shape drawn twice,
+// each copy clipped to one side of the pace line.
+function gapFill(defs, plot, s, g, X, Y) {
+  const start = g.reset - s.span, pace = t => (t - start) / s.span * 100;
+  const t0 = g.points[0][0];
+  let d = `M${X(t0)} ${Y(g.points[0][1])}`;
+  for (const p of g.points.slice(1)) d += `H${X(p[0])}V${Y(p[1])}`;
+  d += `H${X(g.end)}L${X(g.end)} ${Y(pace(g.end))}L${X(t0)} ${Y(pace(t0))}Z`;
+  for (const [cls, far] of [["ahead", -1e4], ["behind", 1e4]]) {
+    const id = "gap" + uid++;
+    svg("polygon", { points: `${X(start)},${Y(0)} ${X(g.reset)},${Y(100)} ${X(g.reset)},${far} ${X(start)},${far}` },
+      svg("clipPath", { id }, defs));
+    svg("path", { class: cls, d, "clip-path": `url(#${id})` }, plot);
+  }
 }
 
 // The current reading, or null when the latest window has already ended.
@@ -824,11 +891,18 @@ function ticks(x0, x1) {
 }
 
 function legendKey(s, parent) {
-  const k = html("span", "key", undefined, parent);
+  const k = html("button", "key", undefined, parent);
+  k.type = "button";
+  k.setAttribute("aria-pressed", String(paceOn[s.key]));
+  k.title = (paceOn[s.key] ? "Hide" : "Show") + " the pace line";
   html("i", s.css, undefined, k);
   html("span", "", s.label, k);
   const v = current(s);
   html("strong", "", v === null ? "no active window" : v + "%", k);
+  html("i", "dash " + s.css, undefined, k);
+  const p = paceOn[s.key] ? projection(s) : null;
+  if (p) html("span", "proj-txt", p.hit ? `→ 100% ${fmtWhen.format(new Date(p.t * 1000))}` : `→ ~${p.v}% at reset`, k);
+  k.addEventListener("click", () => { paceOn[s.key] = !paceOn[s.key]; update(); });
 }
 
 let uid = 0;
@@ -842,7 +916,8 @@ function drawChart(host, series, height) {
 
   const root = svg("svg", { width, height, viewBox: `0 0 ${width} ${height}`, role: "img", tabindex: 0,
     "aria-label": series.map(s => s.label).join(" and ") + " usage over time; the table view below has the values" }, host);
-  const clip = svg("clipPath", { id }, svg("defs", {}, root));
+  const defs = svg("defs", {}, root);
+  const clip = svg("clipPath", { id }, defs);
   svg("rect", { x: m.l, y: m.t, width: width - m.l - m.r, height: height - m.t - m.b }, clip);
 
   for (const v of [0, 25, 50, 75, 100]) {
@@ -857,7 +932,18 @@ function drawChart(host, series, height) {
       .textContent = midnight ? fmtDay.format(d) : fmtHour.format(d);
   }
 
+  if (x1 > D.now) svg("rect", { class: "future", x: X(D.now), y: m.t, width: X(x1) - X(D.now), height: Y(0) - m.t }, root);
   const plot = svg("g", { "clip-path": `url(#${id})` }, root);
+  // Pace: a straight line from 0% at the window's start to 100% at its reset.
+  for (const s of series) {
+    if (!paceOn[s.key]) continue;
+    for (const g of s.segs) {
+      const start = g.reset - s.span;
+      if (g.reset < x0 || start > x1) continue;
+      if (gap) gapFill(defs, plot, s, g, X, Y);
+      svg("line", { class: "pace " + s.css, x1: X(start), y1: Y(0), x2: X(g.reset), y2: Y(100) }, plot);
+    }
+  }
   for (const s of series) {
     for (const g of s.segs) {
       if (g.end < x0 || g.points[0][0] > x1) continue;
@@ -870,6 +956,15 @@ function drawChart(host, series, height) {
     if (last && last.end >= x0) {
       svg("circle", { class: "dot " + s.css, cx: X(last.end), cy: Y(last.points[last.points.length - 1][1]), r: 4 }, root);
     }
+  }
+
+  for (const s of series) {
+    const p = paceOn[s.key] && projection(s);
+    if (p) svg("line", { class: "proj " + s.css, x1: X(D.now), y1: Y(p.from), x2: X(p.t), y2: Y(p.v) }, plot);
+  }
+  if (x1 > D.now) {
+    svg("line", { class: "now", x1: X(D.now), x2: X(D.now), y1: m.t, y2: Y(0) }, root);
+    svg("text", { class: "tick", x: X(D.now) + 4, y: m.t + 10 }, root).textContent = "now";
   }
 
   // Hover layer: a crosshair snapped to the nearest reading, one tooltip for every series.
@@ -894,6 +989,8 @@ function drawChart(host, series, height) {
       html("i", s.css, undefined, row);
       html("strong", "", v === null ? "–" : v + "%", row);
       html("span", "", s.label, row);
+      const pc = paceOn[s.key] && v !== null ? paceAt(s, t) : null;
+      if (pc !== null) html("span", "", `pace ${pc}% (${v - pc >= 0 ? "+" : ""}${v - pc})`, row);
       if (v === null) dots[j].setAttribute("visibility", "hidden");
       else { dots[j].setAttribute("cx", X(t)); dots[j].setAttribute("cy", Y(v)); dots[j].setAttribute("visibility", "visible"); }
     });
@@ -932,13 +1029,18 @@ function render() {
   drawChart(html("div", "plot", undefined, charts), SERIES, 320);
   const filters = document.getElementById("filters");
   filters.replaceChildren();
-  filters.hidden = presets.length < 2;
-  presets.forEach(([name], i) => {
+  if (presets.length > 1) presets.forEach(([name], i) => {
     const b = html("button", "", name, filters);
     b.type = "button";
     b.setAttribute("aria-pressed", String(i === sel));
     b.addEventListener("click", () => { sel = i; update(); });
   });
+  const g = html("button", "toggle", "Gap to pace", filters);
+  g.type = "button";
+  g.setAttribute("aria-pressed", String(gap));
+  g.disabled = !Object.values(paceOn).some(Boolean);
+  g.title = "Shade where usage runs ahead of its pace line (pink) or behind it (green)";
+  g.addEventListener("click", () => { gap = !gap; update(); });
 }
 
 function tables() {
