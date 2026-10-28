@@ -812,8 +812,14 @@ function ticks(x0, x1) {
   const d = new Date(x0 * 1000);
   if (step >= DAY) d.setHours(0, 0, 0, 0);
   else { d.setMinutes(0, 0, 0); d.setHours(Math.floor(d.getHours() / (step / HOUR)) * (step / HOUR)); }
+  // Step in wall-clock time: a 23 or 25-hour day (daylight saving) would otherwise
+  // shift every later tick off midnight.
   const out = [];
-  for (let t = d.getTime() / 1000; t <= x1; t += step) if (t >= x0) out.push(t);
+  while (d.getTime() / 1000 <= x1) {
+    if (d.getTime() / 1000 >= x0) out.push(d.getTime() / 1000);
+    if (step >= DAY) d.setDate(d.getDate() + step / DAY);
+    else d.setHours(d.getHours() + step / HOUR);
+  }
   return out;
 }
 
