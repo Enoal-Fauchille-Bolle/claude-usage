@@ -677,6 +677,9 @@ h1 { font-size: 20px; font-weight: 600; margin: 0 0 2px; }
 .plot { position: relative; margin-bottom: 8px; }
 .plot svg { display: block; overflow: visible; touch-action: pan-y; }
 .brush { fill: var(--ink); opacity: 0.08; }
+.band-ahead { fill: var(--c4); opacity: 0.07; }
+.band-behind { fill: var(--c2); opacity: 0.07; }
+.band-label { fill: var(--muted); font-size: 11px; }
 .plot svg:focus-visible { outline: 2px solid var(--muted); outline-offset: 4px; border-radius: 4px; }
 .grid { stroke: var(--grid); stroke-width: 1; }
 .axis { stroke: var(--axis); stroke-width: 1; }
@@ -743,6 +746,7 @@ td.num, th.num { text-align: right; }
       Click a legend entry for its pace line (where usage would sit if spread evenly over the window)
       and the dotted projection of the current window at its average rate so far.
       Drag across the chart to pick a custom range.</p>
+    <details id="gap-details"><summary>Gap to pace chart</summary><div id="gap-chart"></div></details>
     <details><summary>Table view</summary><div id="tables"></div></details>
   </div>
   <div class="card" id="spend" hidden>
@@ -911,37 +915,48 @@ function legendKey(s, parent) {
 }
 
 let uid = 0;
-function drawChart(host, series, height) {
+// Vertical scale of a chart: its range, gridlines, value format, and whether pace
+// lines belong on it.
+const MAIN = { lo: 0, hi: 100, grid: [0, 25, 50, 75, 100], fmt: v => v + "%", pace: true, aria: "usage over time" };
+
+function drawChart(host, series, height, opt = MAIN) {
   const width = Math.max(320, host.clientWidth);
   const m = { l: 44, r: 16, t: 12, b: 28 };
   const [x0, x1] = domain();
   const X = t => m.l + (t - x0) / (x1 - x0) * (width - m.l - m.r);
-  const Y = v => height - m.b - v / 100 * (height - m.t - m.b);
+  const Y = v => height - m.b - (v - opt.lo) / (opt.hi - opt.lo) * (height - m.t - m.b);
+  const bottom = height - m.b;
   const id = "clip" + uid++;
 
   const root = svg("svg", { width, height, viewBox: `0 0 ${width} ${height}`, role: "img", tabindex: 0,
-    "aria-label": series.map(s => s.label).join(" and ") + " usage over time; the table view below has the values" }, host);
+    "aria-label": series.map(s => s.label).join(" and ") + " " + opt.aria + "; the table view below has the values" }, host);
   const defs = svg("defs", {}, root);
   const clip = svg("clipPath", { id }, defs);
   svg("rect", { x: m.l, y: m.t, width: width - m.l - m.r, height: height - m.t - m.b }, clip);
 
-  for (const v of [0, 25, 50, 75, 100]) {
+  if (opt.bands) {
+    svg("rect", { class: "band-ahead", x: m.l, y: m.t, width: width - m.l - m.r, height: Y(0) - m.t }, root);
+    svg("rect", { class: "band-behind", x: m.l, y: Y(0), width: width - m.l - m.r, height: bottom - Y(0) }, root);
+    svg("text", { class: "band-label", x: m.l + 6, y: m.t + 12 }, root).textContent = "ahead of pace";
+    svg("text", { class: "band-label", x: m.l + 6, y: bottom - 6 }, root).textContent = "behind pace";
+  }
+  for (const v of opt.grid) {
     svg("line", { class: v === 0 ? "axis" : "grid", x1: m.l, x2: width - m.r, y1: Y(v), y2: Y(v) }, root);
-    svg("text", { class: "tick", x: m.l - 8, y: Y(v) + 4, "text-anchor": "end" }, root).textContent = v + "%";
+    svg("text", { class: "tick", x: m.l - 8, y: Y(v) + 4, "text-anchor": "end" }, root).textContent = opt.fmt(v);
   }
   for (const t of ticks(x0, x1)) {
     const d = new Date(t * 1000);
     const midnight = d.getHours() === 0 && d.getMinutes() === 0;
-    svg("line", { class: "axis", x1: X(t), x2: X(t), y1: Y(0), y2: Y(0) + 4 }, root);
+    svg("line", { class: "axis", x1: X(t), x2: X(t), y1: bottom, y2: bottom + 4 }, root);
     svg("text", { class: "tick" + (midnight ? " day" : ""), x: X(t), y: height - 8, "text-anchor": "middle" }, root)
       .textContent = midnight ? fmtDay.format(d) : fmtHour.format(d);
   }
 
-  if (x1 > D.now) svg("rect", { class: "future", x: X(D.now), y: m.t, width: X(x1) - X(D.now), height: Y(0) - m.t }, root);
+  if (x1 > D.now) svg("rect", { class: "future", x: X(D.now), y: m.t, width: X(x1) - X(D.now), height: bottom - m.t }, root);
   const plot = svg("g", { "clip-path": `url(#${id})` }, root);
   // Pace: a straight line from 0% at the window's start to 100% at its reset.
   for (const s of series) {
-    if (!paceOn[s.key]) continue;
+    if (!opt.pace || !paceOn[s.key]) continue;
     for (const g of s.segs) {
       const start = g.reset - s.span;
       if (g.reset < x0 || start > x1) continue;
@@ -953,7 +968,7 @@ function drawChart(host, series, height) {
     for (const g of s.segs) {
       if (g.end < x0 || g.points[0][0] > x1) continue;
       let d = `M${X(g.points[0][0])} ${Y(g.points[0][1])}`;
-      for (const p of g.points.slice(1)) d += `H${X(p[0])}V${Y(p[1])}`;
+      for (const p of g.points.slice(1)) d += s.linear ? `L${X(p[0])} ${Y(p[1])}` : `H${X(p[0])}V${Y(p[1])}`;
       d += `H${X(g.end)}`;
       svg("path", { class: "line " + s.css, d }, plot);
     }
@@ -964,18 +979,18 @@ function drawChart(host, series, height) {
   }
 
   for (const s of series) {
-    const p = paceOn[s.key] && projection(s);
+    const p = opt.pace && paceOn[s.key] && projection(s);
     if (p) svg("line", { class: "proj " + s.css, x1: X(D.now), y1: Y(p.from), x2: X(p.t), y2: Y(p.v) }, plot);
   }
   if (x1 > D.now) {
-    svg("line", { class: "now", x1: X(D.now), x2: X(D.now), y1: m.t, y2: Y(0) }, root);
+    svg("line", { class: "now", x1: X(D.now), x2: X(D.now), y1: m.t, y2: bottom }, root);
     svg("text", { class: "tick", x: X(D.now) + 4, y: m.t + 10 }, root).textContent = "now";
   }
 
   // Hover layer: a crosshair snapped to the nearest reading, one tooltip for every series.
   const snaps = [...new Set(series.flatMap(s => s.segs.flatMap(g => g.points.map(p => p[0]).concat(g.end))))]
     .filter(t => t >= x0 && t <= x1).sort((a, b) => a - b);
-  const cross = svg("line", { class: "cross", y1: m.t, y2: Y(0), visibility: "hidden" }, root);
+  const cross = svg("line", { class: "cross", y1: m.t, y2: bottom, visibility: "hidden" }, root);
   const dots = series.map(s => svg("circle", { class: "dot " + s.css, r: 4, visibility: "hidden" }, root));
   const tip = html("div", "tip", undefined, host);
   tip.hidden = true;
@@ -992,15 +1007,15 @@ function drawChart(host, series, height) {
       if (v !== null) readings.push(v);
       const row = html("div", "row", undefined, tip);
       html("i", s.css, undefined, row);
-      html("strong", "", v === null ? "–" : v + "%", row);
+      html("strong", "", v === null ? "–" : opt.fmt(v), row);
       html("span", "", s.label, row);
-      const pc = paceOn[s.key] && v !== null ? paceAt(s, t) : null;
+      const pc = opt.pace && paceOn[s.key] && v !== null ? paceAt(s, t) : null;
       if (pc !== null) html("span", "", `pace ${pc}% (${v - pc >= 0 ? "+" : ""}${v - pc})`, row);
       if (v === null) dots[j].setAttribute("visibility", "hidden");
       else { dots[j].setAttribute("cx", X(t)); dots[j].setAttribute("cy", Y(v)); dots[j].setAttribute("visibility", "visible"); }
     });
     tip.hidden = false;
-    tip.style.top = (Math.max(...readings, 0) > 50 ? Y(0) - tip.offsetHeight - 8 : m.t + 4) + "px";
+    tip.style.top = (Math.min(...readings.map(Y), bottom) < (m.t + bottom) / 2 ? bottom - tip.offsetHeight - 8 : m.t + 4) + "px";
     const flip = X(t) > width * 0.6;
     tip.style.left = flip ? "auto" : X(t) + 12 + "px";
     tip.style.right = flip ? width - X(t) + 12 + "px" : "auto";
@@ -1015,7 +1030,7 @@ function drawChart(host, series, height) {
 
   // Custom range: press, drag across the chart, release. Past-now is cut off; a
   // vertical swipe still scrolls the page on a touch screen (touch-action: pan-y).
-  const brush = svg("rect", { class: "brush", y: m.t, height: Y(0) - m.t, visibility: "hidden" }, root);
+  const brush = svg("rect", { class: "brush", y: m.t, height: bottom - m.t, visibility: "hidden" }, root);
   let drag = null;
   const pick = t => [Math.min(drag.a, t), Math.min(Math.max(drag.a, t), D.now)];
   const brushTo = t => {
@@ -1065,12 +1080,55 @@ function drawChart(host, series, height) {
   });
 }
 
+// Gap to pace: usage minus pace, in points. Between two readings usage stays put
+// while pace keeps climbing, so the gap slides down, then jumps at the next reading.
+function gapSeries(s) {
+  return { ...s, linear: true, segs: s.segs.map(g => {
+    const start = g.reset - s.span, gapAt = (t, v) => Math.round(v - (t - start) / s.span * 100);
+    const points = [];
+    g.points.forEach(([t, v], i) => {
+      if (i) points.push([t, gapAt(t, g.points[i - 1][1])]);
+      points.push([t, gapAt(t, v)]);
+    });
+    points.push([g.end, gapAt(g.end, g.points[g.points.length - 1][1])]);
+    return { ...g, points };
+  }) };
+}
+
+const fmtGap = v => (v > 0 ? "+" : v < 0 ? "−" : "") + Math.abs(v);
+// One chart per series, each on its own scale: the 5-hour gap swings far wider than
+// the weekly one. A series shows once its pace line is on.
+function drawGap(host) {
+  const series = SERIES.filter(s => paceOn[s.key]);
+  if (!series.length) return html("p", "note", "Click a legend entry above to show its gap to pace.", host);
+  const [x0, x1] = domain();
+  for (const s of series.map(gapSeries)) {
+    const k = html("span", "key", undefined, html("div", "legend", undefined, host));
+    html("i", s.css, undefined, k);
+    html("span", "", s.label, k);
+    const v = current(s);
+    html("strong", "", v === null ? "no active window" : fmtGap(v) + " pts", k);
+    // A scale symmetric around zero, in steps of 10 points, wide enough for what is shown.
+    let top = 0;
+    for (const g of s.segs) {
+      if (g.end < x0 || g.points[0][0] > x1) continue;
+      for (const p of g.points) if (p[0] >= x0 && p[0] <= x1) top = Math.max(top, Math.abs(p[1]));
+    }
+    const hi = Math.max(10, Math.ceil(top / 10) * 10);
+    drawChart(html("div", "plot", undefined, host), [s], 220,
+      { lo: -hi, hi, grid: [-hi, -hi / 2, 0, hi / 2, hi], fmt: fmtGap, bands: true, aria: "gap to pace over time" });
+  }
+}
+
 function render() {
   const charts = document.getElementById("charts");
   charts.replaceChildren();
   const legend = html("div", "legend", undefined, charts);
   SERIES.forEach(s => legendKey(s, legend));
   drawChart(html("div", "plot", undefined, charts), SERIES, 320);
+  const gapHost = document.getElementById("gap-chart");
+  gapHost.replaceChildren();
+  if (document.getElementById("gap-details").open) drawGap(gapHost);
   const filters = document.getElementById("filters");
   filters.replaceChildren();
   if (presets.length > 1) presets.forEach(([name], i) => {
@@ -1400,6 +1458,7 @@ function update() {
   spendTables();
   renderSpend();
 }
+document.getElementById("gap-details").addEventListener("toggle", render);
 update();
 let drawnWidth = document.getElementById("charts").clientWidth;
 new ResizeObserver(() => {
