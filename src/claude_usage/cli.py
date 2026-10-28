@@ -24,6 +24,7 @@ Usage:
     claude-usage --json          # machine-readable output
     claude-usage --graph         # HTML page: official 5-hour/weekly quota, spend by project/model,
                                  # every figure following its 24 h / 3 days / 7 days / All filter
+                                 # or a range dragged across the chart
     claude-usage --graph out.html
     claude-usage --web 22        # claude.ai took 22% of this week's usage
 """
@@ -674,7 +675,8 @@ h1 { font-size: 20px; font-weight: 600; margin: 0 0 2px; }
 .key i { width: 16px; height: 0; border-top: 2px solid var(--c); border-radius: 1px; }
 .key strong { color: var(--ink); font-weight: 600; }
 .plot { position: relative; margin-bottom: 8px; }
-.plot svg { display: block; overflow: visible; }
+.plot svg { display: block; overflow: visible; touch-action: pan-y; }
+.brush { fill: var(--ink); opacity: 0.08; }
 .plot svg:focus-visible { outline: 2px solid var(--muted); outline-offset: 4px; border-radius: 4px; }
 .grid { stroke: var(--grid); stroke-width: 1; }
 .axis { stroke: var(--axis); stroke-width: 1; }
@@ -739,7 +741,8 @@ td.num, th.num { text-align: right; }
     <p class="note">Each line is one limit window; a break means the window ended or nothing was recorded.
       Readings below an earlier one in the same window are stale and ignored.
       Click a legend entry for its pace line (where usage would sit if spread evenly over the window)
-      and the dotted projection of the current window at its average rate so far.</p>
+      and the dotted projection of the current window at its average rate so far.
+      Drag across the chart to pick a custom range.</p>
     <details><summary>Table view</summary><div id="tables"></div></details>
   </div>
   <div class="card" id="spend" hidden>
@@ -784,6 +787,7 @@ presets.push(["All", 0]);
 
 // A weekly window is 7 days long, so that is the view that shows a whole one.
 let sel = Math.max(presets.findIndex(([name]) => name === "7 days"), 0) || presets.length - 1;
+let custom = null;  // [from, to] picked by dragging across the chart; overrides the preset
 
 // Pace lines, off until their legend entry is clicked, and the shading of the gap to them.
 const paceOn = { five: false, seven: false };
@@ -810,6 +814,7 @@ const html = (tag, cls, text, parent) => {
 // A pace line carries the axis past now, to the reset of its active window, so the
 // projection has room; the future never takes more than a third of the axis.
 const domain = () => {
+  if (custom) return custom;
   const x0 = presets[sel][1] ? Math.max(D.now - presets[sel][1], first) : first;
   let x1 = D.now;
   for (const s of SERIES) {
@@ -1003,19 +1008,58 @@ function drawChart(host, series, height) {
 
   let cur = snaps.length - 1;
   const hit = svg("rect", { x: m.l, y: m.t, width: width - m.l - m.r, height: height - m.t - m.b, fill: "transparent" }, root);
+  const timeAt = e => {
+    const px = Math.min(Math.max(e.clientX - root.getBoundingClientRect().left, m.l), width - m.r);
+    return x0 + (px - m.l) / (width - m.l - m.r) * (x1 - x0);
+  };
+
+  // Custom range: press, drag across the chart, release. Past-now is cut off; a
+  // vertical swipe still scrolls the page on a touch screen (touch-action: pan-y).
+  const brush = svg("rect", { class: "brush", y: m.t, height: Y(0) - m.t, visibility: "hidden" }, root);
+  let drag = null;
+  const pick = t => [Math.min(drag.a, t), Math.min(Math.max(drag.a, t), D.now)];
+  const brushTo = t => {
+    const [a, b] = pick(t);
+    brush.setAttribute("x", X(a)); brush.setAttribute("width", Math.max(0, X(b) - X(a)));
+    brush.setAttribute("visibility", "visible");
+    hide();
+    tip.replaceChildren(html("div", "when", fmtWhen.format(new Date(a * 1000)) + " → " + fmtWhen.format(new Date(b * 1000))));
+    tip.hidden = false;
+    tip.style.top = m.t + 4 + "px";
+    const flip = X(b) > width * 0.6;
+    tip.style.left = flip ? "auto" : X(b) + 12 + "px";
+    tip.style.right = flip ? width - X(a) + 12 + "px" : "auto";
+  };
+  const endDrag = () => { drag = null; brush.setAttribute("visibility", "hidden"); };
+  hit.addEventListener("pointerdown", e => {
+    if (e.button !== 0) return;
+    drag = { a: timeAt(e), px: e.clientX };
+    hit.setPointerCapture(e.pointerId);
+    brushTo(drag.a);
+  });
+  hit.addEventListener("pointerup", e => {
+    // A click, or a drag of a few pixels, is not a range.
+    if (drag && Math.abs(e.clientX - drag.px) > 8) {
+      custom = pick(timeAt(e));
+      endDrag();
+      return update();
+    }
+    endDrag();
+  });
+  hit.addEventListener("pointercancel", endDrag);
   hit.addEventListener("pointermove", e => {
-    const px = e.clientX - root.getBoundingClientRect().left;
-    const t = x0 + (px - m.l) / (width - m.l - m.r) * (x1 - x0);
+    if (drag) return brushTo(timeAt(e));
+    const t = timeAt(e);
     cur = snaps.reduce((best, s, i) => Math.abs(s - t) < Math.abs(snaps[best] - t) ? i : best, 0);
     show(cur);
   });
-  hit.addEventListener("pointerleave", hide);
+  hit.addEventListener("pointerleave", () => { if (!drag) hide(); });
   root.addEventListener("focus", () => show(cur));
   root.addEventListener("blur", hide);
   root.addEventListener("keydown", e => {
     if (e.key === "ArrowLeft") cur = Math.max(0, cur - 1);
     else if (e.key === "ArrowRight") cur = Math.min(snaps.length - 1, cur + 1);
-    else if (e.key === "Escape") return hide();
+    else if (e.key === "Escape") { endDrag(); return hide(); }
     else return;
     e.preventDefault(); show(cur);
   });
@@ -1032,9 +1076,16 @@ function render() {
   if (presets.length > 1) presets.forEach(([name], i) => {
     const b = html("button", "", name, filters);
     b.type = "button";
-    b.setAttribute("aria-pressed", String(i === sel));
-    b.addEventListener("click", () => { sel = i; update(); });
+    b.setAttribute("aria-pressed", String(!custom && i === sel));
+    b.addEventListener("click", () => { sel = i; custom = null; update(); });
   });
+  if (custom) {
+    const c = html("button", "", custom.map(t => fmtWhen.format(new Date(t * 1000))).join(" → ") + "  ✕", filters);
+    c.type = "button";
+    c.setAttribute("aria-pressed", "true");
+    c.title = "Back to " + presets[sel][0];
+    c.addEventListener("click", () => { custom = null; update(); });
+  }
   const g = html("button", "toggle", "Gap to pace", filters);
   g.type = "button";
   g.setAttribute("aria-pressed", String(gap));
@@ -1047,14 +1098,14 @@ function tables() {
   const host = document.getElementById("tables");
   host.replaceChildren();
   const fmt = t => fmtWhen.format(new Date(t * 1000));
-  const x0 = domain()[0];
+  const [x0, x1] = domain();
   for (const s of SERIES) {
     const table = html("table", "", undefined, host);
     html("caption", "", s.label, table);
     const head = html("tr", "", undefined, html("thead", "", undefined, table));
     ["First reading", "Last reading", "Window resets", "Peak"].forEach(h => html("th", "", h, head));
     const body = html("tbody", "", undefined, table);
-    for (const g of s.segs.filter(g => g.end >= x0)) {
+    for (const g of s.segs.filter(g => g.end >= x0 && g.points[0][0] <= x1)) {
       const row = html("tr", "", undefined, body);
       [fmt(g.points[0][0]), fmt(g.end), fmt(g.reset), g.points[g.points.length - 1][1] + "%"].forEach(c => html("td", "", c, row));
     }
@@ -1074,8 +1125,10 @@ const slot = j => "k" + Math.min(j, 7);
 // 24 h or less is cut by hour, a longer one by day; "All" starts at the first request.
 // A request is [time, project, model, session, cost, cold-cache rewrite cost, over 150k].
 function aggregate() {
-  const range = presets[sel][1], from = range ? D.now - range : 0;
-  const hourly = range > 0 && range <= DAY;
+  const range = presets[sel][1];
+  const [from, to] = custom ?? [range ? D.now - range : 0, D.now];
+  // A custom range of up to two days is still worth one column per hour.
+  const hourly = custom ? to - from <= 2 * DAY : range > 0 && range <= DAY;
   const projects = RAW.projects.map(p => ({ ...p, cost: 0, stale: 0, long: 0, ids: new Set() }));
   const models = RAW.models.map(name => ({ name, cost: 0, requests: 0 }));
   const binOf = t => {
@@ -1083,7 +1136,7 @@ function aggregate() {
     if (hourly) d.setMinutes(0, 0, 0); else d.setHours(0, 0, 0, 0);
     return d.getTime() / 1000;
   };
-  const inRange = RAW.requests.filter(r => r[0] >= from);
+  const inRange = RAW.requests.filter(r => r[0] >= from && r[0] <= to);
   let total = 0, start = Infinity;
   for (const [t, p, m, id, cost, stale, long] of inRange) {
     total += cost;
@@ -1107,10 +1160,10 @@ function aggregate() {
     bins.get(b)[slotOf.get(p)] += cost;
   }
 
-  // One column per hour or day up to now, the empty ones included.
+  // One column per hour or day up to the end of the range, the empty ones included.
   const daily = [];
   const step = d => hourly ? d.setHours(d.getHours() + 1) : d.setDate(d.getDate() + 1);
-  for (const d = new Date(binOf(from || (start === Infinity ? D.now : start)) * 1000); d.getTime() / 1000 <= D.now; step(d)) {
+  for (const d = new Date(binOf(from || (start === Infinity ? D.now : start)) * 1000); d.getTime() / 1000 <= to; step(d)) {
     const t = d.getTime() / 1000;
     daily.push({ t, v: (bins.get(t) ?? empty()).map(c => Math.round(c * 1e4) / 1e4) });
   }
@@ -1340,7 +1393,8 @@ function update() {
   const [name, range] = presets[sel];
   document.getElementById("spend").hidden = false;
   document.getElementById("spend-sub").textContent = `${fmtUsd(S.total)} over ` +
-    (range ? "the last " + name : "every transcript, since " + fmtDate.format(new Date(S.start * 1000))) + ", " +
+    (custom ? "the range from " + custom.map(t => fmtWhen.format(new Date(t * 1000))).join(" to ")
+      : range ? "the last " + name : "every transcript, since " + fmtDate.format(new Date(S.start * 1000))) + ", " +
     "estimated from the local transcripts at API list prices, every account on this machine. " +
     "A different unit from the quota above: claude.ai use is not in it.";
   spendTables();
