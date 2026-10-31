@@ -15,7 +15,8 @@ charges usage credits in, and it tracks plan-limit consumption closely enough to
 be useful. The weekly and 5-hour budgets are measured from the /usage
 percentages the status line records, with the claude.ai share given by --web;
 two constants below stand in when that history is too thin. --session-budget and
---weekly-budget, or the environment variables of the same names, replace both.
+--weekly-budget replace both, as do CLAUDE_USAGE_SESSION_BUDGET and
+CLAUDE_USAGE_WEEKLY_BUDGET.
 
 Usage:
     claude-usage                 # last 28 days
