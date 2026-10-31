@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Analyse local Claude Code transcripts and report on plan-limit consumption.
 
 Claude Code stores one JSONL transcript per session under ~/.claude/projects/.

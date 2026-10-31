@@ -1,0 +1,17 @@
+[project]
+name = "claude-usage"
+version = "0.1.0"
+description = "Report Claude Code plan-limit consumption from the local transcripts"
+readme = "README.md"
+license = "GPL-3.0-only"
+license-files = ["LICENSE"]
+authors = [{ name = "Enoal Fauchille-Bolle" }]
+requires-python = ">=3.13"
+dependencies = []
+
+[project.scripts]
+claude-usage = "claude_usage.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.12.17,<0.13"]
+build-backend = "uv_build"
