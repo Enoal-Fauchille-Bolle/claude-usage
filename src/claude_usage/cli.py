@@ -127,16 +127,8 @@ def accounts() -> list[tuple[str, set[str]]]:
         if not os.path.isfile(history):
             continue
 
-        # The default dir keeps its account file in $HOME, alternates keep it inside.
-        default = os.path.expanduser("~/.claude")
-        account_file = (os.path.expanduser("~/.claude.json") if config_dir == default
-                        else os.path.join(config_dir, ".claude.json"))
+        # The directory name, not the account's e-mail: reports get pasted around.
         label = os.path.basename(config_dir)
-        try:
-            with open(account_file) as fh:
-                label = json.load(fh).get("oauthAccount", {}).get("emailAddress", label)
-        except (OSError, json.JSONDecodeError):
-            pass
 
         ids = set()
         with open(history, errors="replace") as fh:
