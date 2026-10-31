@@ -14,7 +14,8 @@ subscription bills -- the plan is a flat fee -- but it is the unit Anthropic
 charges usage credits in, and it tracks plan-limit consumption closely enough to
 be useful. The weekly and 5-hour budgets are measured from the /usage
 percentages the status line records, with the claude.ai share given by --web;
-two constants below stand in when that history is too thin.
+two constants below stand in when that history is too thin. --session-budget and
+--weekly-budget, or the environment variables of the same names, replace both.
 
 Usage:
     claude-usage                 # last 28 days
@@ -26,6 +27,7 @@ Usage:
                                  # or a range dragged across the chart
     claude-usage --graph out.html
     claude-usage --web 22        # claude.ai took 22% of this week's usage
+    claude-usage --weekly-budget 1350   # a plan five times larger than Pro
 """
 
 from __future__ import annotations
@@ -45,7 +47,7 @@ import time
 
 # --- Calibration -----------------------------------------------------------
 # The budgets are measured from the quota history when it allows (see
-# budgets()); these constants are the fallback. Measured on 2026-10-06 on a Pro
+# measured_budgets()); these constants are the fallback. Measured on 2026-10-06 on a Pro
 # plan, one account, Opus 5.5 and Sonnet 5.5:
 #   week of 2026-09-29: 63% used, 78% of it Claude Code (claude.ai usage page)
 #                       <-> $132 of equivalent spend          -> ~$270 per week
@@ -92,8 +94,8 @@ CACHE_LIFETIME_H = 1.0
 
 PROJECTS = os.path.expanduser("~/.claude/projects")
 
-# The status line appends one reading of the official /usage percentages here
-# each time they change (see claude/.claude/statusline-command.sh).
+# A Claude Code status line appends one reading of the official /usage
+# percentages here each time they change (format in the README).
 QUOTA_HISTORY = os.path.expanduser("~/.claude/state/quota-history.jsonl")
 QUOTA_GRAPH = os.path.expanduser("~/.claude/state/quota-graph.html")
 QUOTA_SPAN = {"five": 5 * 3600, "seven": 7 * 86400}  # window length, seconds
@@ -566,7 +568,18 @@ def record_web(pct: float) -> int:
     return 0
 
 
-def budgets(rows: list[dict], days: int) -> dict:
+def budgets(rows: list[dict], days: int, session: float | None = None,
+            weekly_budget: float | None = None) -> dict:
+    """The measured budgets, replaced by whichever of them the user set."""
+    out = measured_budgets(rows, days)
+    if session is not None:
+        out["session"], out["session_from"] = session, "set by the user"
+    if weekly_budget is not None:
+        out["weekly"], out["weekly_from"] = weekly_budget, "set by the user"
+    return out
+
+
+def measured_budgets(rows: list[dict], days: int) -> dict:
     """$ equivalent of a full week and of a full 5-hour window, measured from the
     quota history, or the constants when it does not allow it.
 
@@ -623,8 +636,6 @@ def budgets(rows: list[dict], days: int) -> dict:
     return out
 
 
-
-
 def write_graph(path: str) -> int:
     """Render the quota history and the Claude Code spend as a self-contained HTML
     page (no external assets). The spend covers every transcript, since the page's
@@ -655,6 +666,13 @@ def write_graph(path: str) -> int:
     return 0
 
 
+def positive_budget(value: str) -> float:
+    budget = float(value)
+    if not 0 < budget < float("inf"):
+        raise ValueError(value)
+    return budget
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--days", type=int, default=28, help="window to analyse (default 28)")
@@ -668,6 +686,16 @@ def main() -> int:
     parser.add_argument("--web", type=float, metavar="PERCENT",
                         help="record the claude.ai share of the week in progress, as shown by "
                              "claude.ai's usage page, and exit")
+    # argparse converts a string default with `type`, so a bad environment value
+    # is reported like a bad flag.
+    parser.add_argument("--session-budget", type=positive_budget, metavar="DOLLARS",
+                        default=os.environ.get("CLAUDE_USAGE_SESSION_BUDGET"),
+                        help="$ equivalent of a full 5-hour window, instead of the measured one "
+                             "(env: CLAUDE_USAGE_SESSION_BUDGET)")
+    parser.add_argument("--weekly-budget", type=positive_budget, metavar="DOLLARS",
+                        default=os.environ.get("CLAUDE_USAGE_WEEKLY_BUDGET"),
+                        help="$ equivalent of a full week, instead of the measured one "
+                             "(env: CLAUDE_USAGE_WEEKLY_BUDGET)")
     args = parser.parse_args()
 
     if args.web is not None:
@@ -681,7 +709,7 @@ def main() -> int:
         return 1
 
     rows = load(args.days)
-    budget = budgets(rows, args.days)
+    budget = budgets(rows, args.days, args.session_budget, args.weekly_budget)
 
     if args.csv:
         with open(args.csv, "w", newline="") as fh:
