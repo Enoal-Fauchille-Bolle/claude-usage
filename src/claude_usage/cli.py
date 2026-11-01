@@ -422,7 +422,7 @@ def report(rows: list[dict], days: int, n_sessions: int, budget: dict) -> None:
     sess = sessions(rows)
     stale = sum(s["stale_cost"] for s in sess)
 
-    print(f"\n  {len(rows):,} requests over {days} days — ${total:,.0f} equivalent\n")
+    print(f"\n  {len(rows):,} requests over {days} days: ${total:,.0f} equivalent\n")
 
     print(f"  WEEKLY  (one Pro seat ≈ ${budget['weekly']:,.0f}/week, {budget['weekly_from']})")
     if budget["weekly_from"] == "constant":
@@ -460,7 +460,7 @@ def report(rows: list[dict], days: int, n_sessions: int, budget: dict) -> None:
             for sid in ids:
                 shared[sid] += 1
 
-        print("\n  BY ACCOUNT  (from each config dir's history.jsonl — a lower bound)")
+        print("\n  BY ACCOUNT  (from each config dir's history.jsonl, a lower bound)")
         buckets = {label: 0.0 for label, _ in known}
         both = unknown = 0.0
         for r in rows:
@@ -479,7 +479,7 @@ def report(rows: list[dict], days: int, n_sessions: int, budget: dict) -> None:
             print(f"    {label:<38} ${spend:7.0f}  {spend / total * 100:4.0f}%")
         if both:
             print(f"    {'(resumed from both config dirs)':<38} ${both:7.0f}  {both / total * 100:4.0f}%")
-        print(f"    {'(unattributed — history.jsonl is capped)':<38} ${unknown:7.0f}  {unknown / total * 100:4.0f}%")
+        print(f"    {'(unattributed, history.jsonl is capped)':<38} ${unknown:7.0f}  {unknown / total * 100:4.0f}%")
 
     print(f"\n  TOP SESSIONS  (a session over ~6h or ~300k context is a /clear you skipped)")
     print(f"    {'session':<10}{'started':<14}{'hours':>7}{'reqs':>6}{'ctx max':>9}"
@@ -1032,7 +1032,7 @@ def main() -> int:
         return write_graph(args.graph)
 
     if not os.path.isdir(PROJECTS):
-        print(f"{PROJECTS} not found — is Claude Code installed?", file=sys.stderr)
+        print(f"{PROJECTS} not found: is Claude Code installed?", file=sys.stderr)
         return 1
 
     rows = load(args.days)
