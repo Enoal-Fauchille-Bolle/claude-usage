@@ -29,6 +29,8 @@ Usage:
     claude-usage --graph out.html
     claude-usage --web 22        # claude.ai took 22% of this week's usage
     claude-usage --weekly-budget 1350   # a plan five times larger than Pro
+    claude-usage record          # status line: save the figures read from stdin
+    claude-usage guard           # UserPromptSubmit hook: warn when a threshold is crossed
 """
 
 from __future__ import annotations
@@ -42,6 +44,7 @@ import glob
 import importlib.resources
 import json
 import os
+import re
 import statistics
 import sys
 import time
@@ -95,14 +98,35 @@ CACHE_LIFETIME_H = 1.0
 
 PROJECTS = os.path.expanduser("~/.claude/projects")
 
-# A Claude Code status line appends one reading of the official /usage
-# percentages here each time they change (format in the README).
-QUOTA_HISTORY = os.path.expanduser("~/.claude/state/quota-history.jsonl")
-QUOTA_GRAPH = os.path.expanduser("~/.claude/state/quota-graph.html")
+STATE_DIR = os.path.expanduser("~/.claude/state")
+
+# claude-usage record appends one reading of the official /usage percentages here
+# each time they change (format in the README).
+QUOTA_HISTORY = os.path.join(STATE_DIR, "quota-history.jsonl")
+QUOTA_GRAPH = os.path.join(STATE_DIR, "quota-graph.html")
 QUOTA_SPAN = {"five": 5 * 3600, "seven": 7 * 86400}  # window length, seconds
 # claude-usage --web appends the claude.ai share of each week here, as read on
 # the "usage this week by product" panel of claude.ai.
-WEB_SHARE = os.path.expanduser("~/.claude/state/web-share.jsonl")
+WEB_SHARE = os.path.join(STATE_DIR, "web-share.jsonl")
+
+# What `claude-usage guard` compares against, each replaced by the environment
+# variable CLAUDE_USAGE_<name>.
+GUARD_DEFAULTS = {
+    "CONTEXT_DECISION": LONG_CONTEXT,  # tokens: same task, /compact; new task, /clear
+    "CONTEXT_STOP": HUGE_CONTEXT,      # tokens
+    "COST_WARN": 15,                   # $ in one conversation
+    "PACE_GAP": 10,                    # points ahead of the share of the window elapsed
+    "QUOTA_HARD": 90,                  # %: past this, the pace no longer matters
+    "FIVE_WARN": 70,                   # % of the 5-hour window, when its reset time is unknown
+    "SEVEN_WARN": 80,                  # % of the week, when its reset time is unknown
+    "CACHE_MIN": 100_000,              # tokens: a cold cache only matters on a big context
+    "CACHE_TTL": CACHE_LIFETIME_H * 3600,  # seconds; 300 when drawing on usage credits
+    "STATE_MAX_AGE": 900,              # seconds: older figures from the status line are stale
+}
+
+# A session leaves its ctx-<session>.txt behind when it ends.
+CONTEXT_FILE_MAX_AGE = 7 * 86400
+SWEEP_EVERY = 86400
 
 # Projects that get their own colour in the per-day chart. The categorical
 # palette has eight slots; the eighth is "Other".
@@ -538,7 +562,7 @@ def record_web(pct: float) -> int:
         print("--web takes a percentage between 0 and 100.", file=sys.stderr)
         return 1
     if not os.path.isfile(QUOTA_HISTORY):
-        print(f"{QUOTA_HISTORY} not found — the status line records it while Claude Code runs.",
+        print(f"{QUOTA_HISTORY} not found: `claude-usage record` writes it from the status line.",
               file=sys.stderr)
         return 1
     account, records = load_quota()
@@ -634,7 +658,7 @@ def write_graph(path: str) -> int:
     page (no external assets). The spend covers every transcript, since the page's
     time range filter cuts it down."""
     if not os.path.isfile(QUOTA_HISTORY):
-        print(f"{QUOTA_HISTORY} not found — the status line records it while Claude Code runs.",
+        print(f"{QUOTA_HISTORY} not found: `claude-usage record` writes it from the status line.",
               file=sys.stderr)
         return 1
 
@@ -659,6 +683,305 @@ def write_graph(path: str) -> int:
     return 0
 
 
+def field(payload: object, *keys: str) -> int | float | None:
+    """The number at this path of a JSON object, or None if anything else is there."""
+    for key in keys:
+        payload = payload.get(key) if isinstance(payload, dict) else None
+    return payload if isinstance(payload, (int, float)) and not isinstance(payload, bool) else None
+
+
+def guard_setting(name: str) -> float:
+    """A guard threshold. A bad value falls back on the default: the guard runs on
+    every prompt, where an error message would reach nobody who can act on it."""
+    try:
+        value = float(os.environ[f"CLAUDE_USAGE_{name}"])
+    except (KeyError, ValueError):
+        return GUARD_DEFAULTS[name]
+    return value if 0 <= value < float("inf") else GUARD_DEFAULTS[name]
+
+
+def tail(path: str, size: int) -> str:
+    """The last `size` bytes of a file, which is empty when it cannot be read.
+    Transcripts grow to many megabytes, and only their end matters here."""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, fh.tell() - size))
+            return fh.read().decode(errors="replace")
+    except OSError:
+        return ""
+
+
+def last_activity(transcript: str) -> int | None:
+    """Time of the last line of a transcript. No payload has a cache field, so the
+    age of that line is the only measure of how long the prompt cache has left."""
+    stamps = re.findall(r'"timestamp":"([^"]+)"', tail(transcript, 65536))
+    try:
+        return int(dt.datetime.fromisoformat(stamps[-1]).timestamp())
+    except (IndexError, ValueError):
+        return None
+
+
+def context_file(transcript: str) -> str:
+    """State file of a session. The transcript is named after the session, so two
+    sessions never share one."""
+    session = os.path.basename(transcript).removesuffix(".jsonl")
+    return os.path.join(STATE_DIR, f"ctx-{session}.txt")
+
+
+def write_context(payload: dict, transcript: str) -> None:
+    """Publish the status line's figures for `guard`, which receives none of them:
+    no hook input carries the context size, the cost or the quotas."""
+    usage = (field(payload, "context_window", "current_usage", key)
+             for key in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+    used = field(payload, "context_window", "used_percentage")
+    window = field(payload, "context_window", "context_window_size") or 0
+    # The three input buckets are disjoint, so their sum is the real prompt size.
+    tokens = sum(n or 0 for n in usage) or int(window * (used or 0) / 100)
+
+    def whole(value: int | float | None) -> str:
+        return "" if value is None else str(int(value))
+
+    activity = last_activity(transcript)
+    figures = {
+        "pct": "" if used is None else f"{used:.0f}",
+        "tokens": tokens,
+        "window": window,
+        "cost": field(payload, "cost", "total_cost_usd") or 0,
+        "five": whole(field(payload, "rate_limits", "five_hour", "used_percentage")),
+        "seven": whole(field(payload, "rate_limits", "seven_day", "used_percentage")),
+        "five_reset": whole(field(payload, "rate_limits", "five_hour", "resets_at")),
+        "seven_reset": whole(field(payload, "rate_limits", "seven_day", "resets_at")),
+        "cache_expiry": int(activity + guard_setting("CACHE_TTL")) if activity else 0,
+    }
+    # Renamed into place, so `guard` never reads a half-written file.
+    path = context_file(transcript)
+    temporary = f"{path}.{os.getpid()}.tmp"
+    with open(temporary, "w") as fh:
+        fh.writelines(f"{key}={value}\n" for key, value in figures.items())
+    os.replace(temporary, path)
+
+
+def append_quota(payload: dict, now: int) -> None:
+    """Add the official percentages to the history when one of its values changed."""
+    five = field(payload, "rate_limits", "five_hour", "used_percentage")
+    seven = field(payload, "rate_limits", "seven_day", "used_percentage")
+    five_reset = field(payload, "rate_limits", "five_hour", "resets_at")
+    seven_reset = field(payload, "rate_limits", "seven_day", "resets_at")
+    if five is None and seven is None:
+        return
+
+    # Each config directory is one account, with limits of its own.
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR") or ".claude"
+    account = os.path.basename(config_dir.rstrip(os.sep))
+    key = "|".join("" if v is None else str(v) for v in (five, seven, five_reset, seven_reset))
+    last_file = os.path.join(STATE_DIR, f"quota-last-{account}.txt")
+    try:
+        with open(last_file) as fh:
+            if fh.read() == key:
+                return
+    except OSError:
+        pass
+    with open(last_file, "w") as fh:
+        fh.write(key)
+    line = json.dumps({"ts": now, "account": account, "five": five, "seven": seven,
+                       "five_reset": five_reset, "seven_reset": seven_reset},
+                      separators=(",", ":"))
+    with open(QUOTA_HISTORY, "a") as fh:
+        fh.write(line + "\n")
+
+
+def sweep_context_files(now: int) -> None:
+    """Delete the state files of old sessions, at most once a day."""
+    marker = os.path.join(STATE_DIR, ".last-sweep")
+    try:
+        if now - os.path.getmtime(marker) <= SWEEP_EVERY:
+            return
+    except OSError:
+        pass
+    for path in glob.glob(os.path.join(STATE_DIR, "ctx-*.txt")):
+        try:
+            if now - os.path.getmtime(path) > CONTEXT_FILE_MAX_AGE:
+                os.remove(path)
+        except OSError:
+            continue  # another session swept it first
+    with open(marker, "a"):
+        os.utime(marker)
+
+
+def record() -> int:
+    """`claude-usage record`: save what Claude Code hands a status line on stdin.
+
+    Prints nothing on stdout, which is what a status line displays.
+    """
+    try:
+        payload = json.load(sys.stdin)
+    except ValueError as error:
+        print(f"claude-usage record: stdin is not JSON: {error}", file=sys.stderr)
+        return 1
+    if not isinstance(payload, dict):
+        print("claude-usage record: stdin is not a JSON object.", file=sys.stderr)
+        return 1
+
+    now = int(time.time())
+    transcript = payload.get("transcript_path")
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        if transcript and isinstance(transcript, str):
+            write_context(payload, transcript)
+        append_quota(payload, now)
+        sweep_context_files(now)
+    except OSError as error:
+        print(f"claude-usage record: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def read_context(transcript: str, now: int) -> dict[str, str]:
+    """The figures `record` last published for this session, unless they are stale.
+    Parsed key by key, so a mangled file only loses the keys it mangled."""
+    path = context_file(transcript)
+    try:
+        if now - os.path.getmtime(path) > guard_setting("STATE_MAX_AGE"):
+            return {}
+        with open(path, errors="replace") as fh:
+            return dict(line.rstrip("\n").partition("=")[::2] for line in fh)
+    except OSError:
+        return {}
+
+
+def last_prompt_size(transcript: str) -> int:
+    """Size of the prompt the next request resends, from the last assistant turn.
+    A status line only redraws when Claude Code repaints, so an idle session has no
+    fresh figures. Sidechain turns belong to a subagent's context, not this one's."""
+    for line in reversed(tail(transcript, 1_000_000).splitlines()):
+        if '"assistant"' not in line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue  # the first line of the slice is usually cut
+        if isinstance(entry, dict) and entry.get("type") == "assistant" \
+                and not entry.get("isSidechain"):
+            return int(sum(field(entry, "message", "usage", key) or 0
+                           for key in ("input_tokens", "cache_creation_input_tokens",
+                                       "cache_read_input_tokens")))
+    return 0
+
+
+def pace_gap(pct: int, reset: int | None, span: int, now: int) -> tuple[int | None, int | None]:
+    """The pace is the share of the window already elapsed, where usage would sit if
+    the quota were spent evenly until the reset. Returns it with how far `pct` is
+    ahead of it, or (None, None) when the reset time is unknown."""
+    if not reset or reset <= 0:
+        return None, None
+    pace = min(100, max(0, (span - (reset - now)) * 100 // span))
+    return pace, pct - pace
+
+
+def quota_crossed(pct: int | None, gap: int | None, fallback: str) -> bool:
+    """A raw 73% is fine three hours into a 5-hour window: what matters is the gap to
+    the pace. Past QUOTA_HARD one large request can reach the limit, whatever the pace."""
+    if pct is None or pct < 0:
+        return False
+    if pct >= guard_setting("QUOTA_HARD"):
+        return True
+    if gap is not None:
+        return gap > guard_setting("PACE_GAP")
+    return pct >= guard_setting(fallback)
+
+
+def format_quota(label: str, pct: int | None, pace: int | None, gap: int | None) -> str:
+    if pct is None:
+        return ""
+    if gap is None:
+        return f" · {label} {pct}%"
+    return f" · {label} {pct}% (pace {pace}%, {'±0' if gap == 0 else f'{gap:+d}'})"
+
+
+def guard() -> int:
+    """`claude-usage guard`: UserPromptSubmit hook printing a [budget] line for Claude.
+
+    Claude cannot see how full its own context is, so a rule such as "warn me past
+    150k tokens" needs this measure to be followed. UserPromptSubmit is the event
+    whose stdout reaches Claude before the request is sent. Below every threshold
+    nothing is printed, so most prompts cost no tokens.
+
+    It reports which thresholds were crossed and never what to do about them: that
+    belongs in the user's CLAUDE.md. It always lets the prompt through, because a
+    hook that exits with 2 would reject it.
+    """
+    try:
+        payload = json.load(sys.stdin)
+    except ValueError:
+        return 0
+    transcript = payload.get("transcript_path") if isinstance(payload, dict) else None
+    if not transcript or not isinstance(transcript, str):
+        return 0
+
+    def whole(key: str) -> int | None:
+        try:
+            return int(state.get(key, ""))
+        except ValueError:
+            return None
+
+    now = int(time.time())
+    state = read_context(transcript, now)
+    tokens = whole("tokens") or last_prompt_size(transcript)
+    if tokens <= 0:
+        return 0
+
+    window = whole("window")
+    window = window if window and window > 0 else 1_000_000
+    pct = whole("pct")
+    pct = tokens * 100 // window if pct is None else pct
+    try:
+        cost = float(state.get("cost", 0))
+    except ValueError:
+        cost = 0.0
+    five, seven = whole("five"), whole("seven")
+    cache_expiry = whole("cache_expiry")
+    if not cache_expiry:
+        activity = last_activity(transcript)
+        cache_expiry = int(activity + guard_setting("CACHE_TTL")) if activity else 0
+
+    five_pace, five_gap = (None, None) if five is None else \
+        pace_gap(five, whole("five_reset"), QUOTA_SPAN["five"], now)
+    seven_pace, seven_gap = (None, None) if seven is None else \
+        pace_gap(seven, whole("seven_reset"), QUOTA_SPAN["seven"], now)
+    cold = bool(cache_expiry) and now >= cache_expiry and tokens >= guard_setting("CACHE_MIN")
+
+    crossed = []
+    if tokens >= guard_setting("CONTEXT_STOP"):
+        crossed.append("CONTEXT_STOP")
+    elif tokens >= guard_setting("CONTEXT_DECISION"):
+        crossed.append("CONTEXT_DECISION")
+    if cost >= guard_setting("COST_WARN"):
+        crossed.append("COST")
+    if quota_crossed(five, five_gap, "FIVE_WARN"):
+        crossed.append("QUOTA_5H")
+    if quota_crossed(seven, seven_gap, "SEVEN_WARN"):
+        crossed.append("QUOTA_7D")
+    if cold:
+        crossed.append("COLD_CACHE")
+    if not crossed:
+        return 0
+
+    line = f"context {tokens // 1000}k ({pct}%)"
+    if cost > 0:
+        line += f" · ${cost:.2f}"
+    line += format_quota("5h", five, five_pace, five_gap)
+    line += format_quota("7d", seven, seven_pace, seven_gap)
+    if cold:
+        line += f" · cold cache since {dt.datetime.fromtimestamp(cache_expiry):%H:%M}"
+    print(f"[budget] {line}")
+    print(f"[budget] thresholds crossed: {','.join(crossed)}")
+    return 0
+
+
+COMMANDS = {"record": record, "guard": guard}
+
+
 def positive_budget(value: str) -> float:
     budget = float(value)
     if not 0 < budget < float("inf"):
@@ -667,7 +990,15 @@ def positive_budget(value: str) -> float:
 
 
 def main() -> int:
+    # Ahead of the parser, which exits with 2 on a bad CLAUDE_USAGE_*_BUDGET value:
+    # neither command reads those, and a hook exiting with 2 rejects the user's prompt.
+    if sys.argv[1:] in (["record"], ["guard"]):
+        return COMMANDS[sys.argv[1]]()
+
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    commands = parser.add_subparsers(dest="command", title="commands to run from Claude Code")
+    commands.add_parser("record", help="status line: save the figures Claude Code sends on stdin")
+    commands.add_parser("guard", help="UserPromptSubmit hook: warn when a threshold is crossed")
     parser.add_argument("--days", type=int, default=28, help="window to analyse (default 28)")
     parser.add_argument("--sessions", type=int, default=12, help="rows in the session table")
     parser.add_argument("--json", action="store_true", help="emit JSON instead of a report")
@@ -690,6 +1021,9 @@ def main() -> int:
                         help="$ equivalent of a full week, instead of the measured one "
                              "(env: CLAUDE_USAGE_WEEKLY_BUDGET)")
     args = parser.parse_args()
+
+    if args.command:
+        parser.error(f"{args.command} takes no option")
 
     if args.web is not None:
         return record_web(args.web)
